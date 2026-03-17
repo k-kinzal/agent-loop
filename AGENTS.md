@@ -24,6 +24,7 @@ Each iteration starts as a brand-new session. The agent picks up previous work t
 - `copilot-loop` — Standalone loop wrapper for GitHub Copilot CLI using plain process restarts
 - `cursor-loop` — Standalone loop wrapper for Cursor Agent CLI using plain process restarts
 - `opencode-loop` — Standalone loop wrapper for OpenCode CLI using plain process restarts
+- `cline-loop` — Standalone loop wrapper for Cline CLI using plain process restarts
 
 ## Distribution requirement
 

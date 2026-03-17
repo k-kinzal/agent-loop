@@ -20,6 +20,7 @@ wrapper, not the agent, responsible for loop control.
 - `copilot-loop`: GitHub Copilot CLI wrapper for iterative process restarts
 - `cursor-loop`: Cursor Agent CLI wrapper for iterative process restarts
 - `opencode-loop`: OpenCode CLI wrapper for iterative process restarts
+- `cline-loop`: Cline CLI wrapper for iterative process restarts
 
 ## Installation
 
@@ -36,7 +37,7 @@ You can also clone the repository and install whichever scripts you need.
 ```bash
 git clone <repo-url>
 cd agent-loop
-chmod +x claude-loop codex-loop gemini-loop copilot-loop cursor-loop opencode-loop
+chmod +x claude-loop codex-loop gemini-loop copilot-loop cursor-loop opencode-loop cline-loop
 ```
 
 ## Loop behavior
@@ -116,6 +117,15 @@ codex-loop -- --help
 - Reliable autonomous looping is best with `opencode run ...`
 - The default OpenCode TUI still launches, but the wrapper cannot start the
   next iteration until that session exits
+
+### `cline-loop`
+
+- Depends on `cline`
+- Uses plain process restarts rather than Cline-specific hooks
+- Reliable autonomous looping is best with `cline --oneshot ...` or other
+  headless flags such as `--yolo` or `--no-interactive`
+- Interactive Cline still launches, but the wrapper cannot start the next
+  iteration until that session exits
 
 ## Development
 
