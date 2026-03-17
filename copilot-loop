@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+#
+# copilot-loop - Run GitHub Copilot CLI in a managed restart loop
+#
+# USAGE
+#     copilot-loop [LOOP_OPTIONS] [--] [COPILOT_ARGS...]
+#
+# DESCRIPTION
+#     Launches GitHub Copilot CLI as a fresh process on each iteration. When
+#     Copilot exits successfully, copilot-loop decides whether to stop or start
+#     a new Copilot process.
+#
+#     Interactive Copilot sessions are supported, but the loop can only
+#     continue after Copilot exits. For autonomous looping, prefer prompt mode
+#     such as `copilot -p ...`, optionally with Copilot's own autopilot flags.
+#
+# LOOP OPTIONS
+#     --max-iteration N
+#     --loop-max-iteration N
+#         Stop after N successful iterations. Default: 0 (unlimited)
+#
+#     --completion-promise TEXT
+#     --loop-completion-promise TEXT
+#         Stop when TEXT appears in Copilot output
+#         Note: promise matching is best-effort for full-screen TUI sessions
+#
+#     --debug
+#     --loop-debug
+#         Enable copilot-loop debug logging
+#
+#     --help, -h
+#         Show this help message
+#
+#     All other options are passed through to copilot. To pass a flag that
+#     would otherwise be interpreted by copilot-loop, place it after `--`.
+#
+# EXAMPLES
+#     copilot-loop --max-iteration 5 -- -p "implement feature X"
+#     copilot-loop --completion-promise "DONE" -- -p "work until done"
+#     copilot-loop --max-iteration 1
+#     copilot-loop -- --help
+#
+# DEPENDENCIES
+#     - bash
+#     - copilot
+#     - script (only needed for interactive completion-promise capture)
+#
+
+set -euo pipefail
+
+readonly WRAPPER_NAME="copilot-loop"
+readonly AGENT_NAME="GitHub Copilot CLI"
+: "${COPILOT_LOOP_BIN:=copilot}"
+readonly AGENT_BIN="$COPILOT_LOOP_BIN"
+
+ITERATION=1
+MAX_ITERATIONS=0
+COMPLETION_PROMISE=""
+DEBUG=false
+AGENT_ARGS=()
+TRANSCRIPT_FILE=""
+
+log() {
+  [[ "$DEBUG" == "true" ]] && printf '[%s] %s\n' "$WRAPPER_NAME" "$1" >&2 || true
+}
+
+log_error() {
+  printf '[%s] ERROR: %s\n' "$WRAPPER_NAME" "$1" >&2
+}
+
+show_usage() {
+  awk '
+    NR >= 2 {
+      if ($0 !~ /^#/) {
+        exit
+      }
+      sub(/^# ?/, "")
+      print
+    }
+  ' "$0"
+}
+
+check_dependencies() {
+  command -v "$AGENT_BIN" >/dev/null 2>&1 || {
+    log_error "$AGENT_NAME executable not found: $AGENT_BIN"
+    exit 1
+  }
+
+  if [[ -n "$COMPLETION_PROMISE" ]] && [[ -t 0 && -t 1 ]]; then
+    command -v script >/dev/null 2>&1 || {
+      log_error "script is required for interactive completion-promise capture."
+      exit 1
+    }
+  fi
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --max-iteration|--loop-max-iteration)
+        [[ $# -ge 2 ]] || {
+          log_error "$1 requires a value."
+          exit 1
+        }
+        MAX_ITERATIONS="$2"
+        shift 2
+        ;;
+      --completion-promise|--loop-completion-promise)
+        [[ $# -ge 2 ]] || {
+          log_error "$1 requires a value."
+          exit 1
+        }
+        COMPLETION_PROMISE="$2"
+        shift 2
+        ;;
+      --debug|--loop-debug)
+        DEBUG=true
+        shift
+        ;;
+      --help|-h)
+        show_usage
+        exit 0
+        ;;
+      --)
+        shift
+        AGENT_ARGS+=("$@")
+        break
+        ;;
+      *)
+        AGENT_ARGS+=("$1")
+        shift
+        ;;
+    esac
+  done
+}
+
+validate_config() {
+  [[ "$MAX_ITERATIONS" =~ ^[0-9]+$ ]] || {
+    log_error "max iteration must be a non-negative integer."
+    exit 1
+  }
+}
+
+setup_transcript_file() {
+  [[ -n "$COMPLETION_PROMISE" ]] || return 0
+  TRANSCRIPT_FILE="$(mktemp "${TMPDIR:-/tmp}/${WRAPPER_NAME}.XXXXXX")"
+}
+
+cleanup() {
+  local exit_code=$?
+  [[ -n "$TRANSCRIPT_FILE" ]] && rm -f "$TRANSCRIPT_FILE"
+  exit "$exit_code"
+}
+
+transcript_contains_promise() {
+  [[ -n "$COMPLETION_PROMISE" ]] || return 1
+  [[ -n "$TRANSCRIPT_FILE" && -f "$TRANSCRIPT_FILE" ]] || return 1
+
+  if LC_ALL=C grep -aFq -- "$COMPLETION_PROMISE" "$TRANSCRIPT_FILE"; then
+    return 0
+  fi
+
+  if command -v strings >/dev/null 2>&1; then
+    if LC_ALL=C strings -a -n 1 "$TRANSCRIPT_FILE" | grep -Fq -- "$COMPLETION_PROMISE"; then
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+run_agent_once() {
+  local exit_code
+
+  if [[ -n "$TRANSCRIPT_FILE" ]]; then
+    : > "$TRANSCRIPT_FILE"
+  fi
+
+  log "starting $AGENT_BIN (iteration $ITERATION)"
+
+  set +e
+  if [[ -n "$COMPLETION_PROMISE" ]]; then
+    if [[ -t 0 && -t 1 ]]; then
+      script -q "$TRANSCRIPT_FILE" "$AGENT_BIN" "${AGENT_ARGS[@]}"
+      exit_code=$?
+    else
+      "$AGENT_BIN" "${AGENT_ARGS[@]}" 2>&1 | tee "$TRANSCRIPT_FILE"
+      exit_code=${PIPESTATUS[0]}
+    fi
+  else
+    "$AGENT_BIN" "${AGENT_ARGS[@]}"
+    exit_code=$?
+  fi
+  set -e
+
+  log "$AGENT_BIN exited with code $exit_code"
+  return "$exit_code"
+}
+
+main() {
+  parse_args "$@"
+  validate_config
+  check_dependencies
+  setup_transcript_file
+  trap cleanup EXIT INT TERM
+
+  if [[ "$MAX_ITERATIONS" -eq 0 ]] && [[ -z "$COMPLETION_PROMISE" ]]; then
+    log "no termination condition configured; the loop will continue until interrupted."
+  fi
+
+  while true; do
+    local exit_code
+    set +e
+    run_agent_once
+    exit_code=$?
+    set -e
+
+    case "$exit_code" in
+      0)
+        ;;
+      129|130|137|143)
+        log "terminating on signal-like exit code: $exit_code"
+        return "$exit_code"
+        ;;
+      *)
+        log "terminating on non-zero exit code: $exit_code"
+        return "$exit_code"
+        ;;
+    esac
+
+    if transcript_contains_promise; then
+      log "completion promise matched after iteration $ITERATION"
+      return 0
+    fi
+
+    if [[ "$MAX_ITERATIONS" -gt 0 ]] && [[ "$ITERATION" -ge "$MAX_ITERATIONS" ]]; then
+      log "maximum iterations reached: $ITERATION"
+      return 0
+    fi
+
+    ITERATION=$((ITERATION + 1))
+    log "restarting $AGENT_BIN"
+  done
+}
+
+main "$@"
