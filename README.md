@@ -19,6 +19,7 @@ wrapper, not the agent, responsible for loop control.
 - `gemini-loop`: Gemini CLI wrapper for iterative process restarts
 - `copilot-loop`: GitHub Copilot CLI wrapper for iterative process restarts
 - `cursor-loop`: Cursor Agent CLI wrapper for iterative process restarts
+- `opencode-loop`: OpenCode CLI wrapper for iterative process restarts
 
 ## Installation
 
@@ -35,7 +36,7 @@ You can also clone the repository and install whichever scripts you need.
 ```bash
 git clone <repo-url>
 cd agent-loop
-chmod +x claude-loop codex-loop gemini-loop copilot-loop cursor-loop
+chmod +x claude-loop codex-loop gemini-loop copilot-loop cursor-loop opencode-loop
 ```
 
 ## Loop behavior
@@ -107,6 +108,14 @@ codex-loop -- --help
 - Reliable autonomous looping is best with `cursor-agent --print ...`
 - Interactive Cursor Agent sessions still launch, but the wrapper cannot start
   the next iteration until the session exits
+
+### `opencode-loop`
+
+- Depends on `opencode`
+- Uses plain process restarts rather than OpenCode-specific hooks
+- Reliable autonomous looping is best with `opencode run ...`
+- The default OpenCode TUI still launches, but the wrapper cannot start the
+  next iteration until that session exits
 
 ## Development
 
