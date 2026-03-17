@@ -98,10 +98,11 @@ codex-loop -- --help
 ### `copilot-loop`
 
 - Depends on `copilot`
-- Uses plain process restarts rather than Copilot-specific hooks
-- Reliable autonomous looping is best with `copilot -p ...`
-- Interactive mode is still launchable, but the next iteration only starts
-  after Copilot exits
+- Depends on `jq`
+- Uses a project-local Copilot `agentStop` hook under `.github/hooks/`
+- Reads Copilot's session transcript to match the completion promise
+- Works for prompt mode and interactive sessions by terminating Copilot after
+  each completed agent turn
 
 ### `cursor-loop`
 

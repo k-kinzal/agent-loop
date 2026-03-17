@@ -1,71 +1,211 @@
 #!/usr/bin/env bash
 #
-# copilot-loop - Run GitHub Copilot CLI in a managed restart loop
+# copilot-loop - Run GitHub Copilot CLI in a managed agentStop-hook loop
 #
 # USAGE
-#     copilot-loop [LOOP_OPTIONS] [--] [COPILOT_ARGS...]
+#     copilot-loop [OPTIONS] [--] [COPILOT_ARGS...]
 #
 # DESCRIPTION
-#     Launches GitHub Copilot CLI as a fresh process on each iteration. When
-#     Copilot exits successfully, copilot-loop decides whether to stop or start
-#     a new Copilot process.
+#     Runs GitHub Copilot CLI under a managed agentStop hook until a
+#     termination condition is met. The hook records the final assistant
+#     message from Copilot's session transcript, decides whether the loop
+#     should continue, and terminates the current Copilot process so the
+#     wrapper can start a fresh session.
 #
-#     Interactive Copilot sessions are supported, but the loop can only
-#     continue after Copilot exits. For autonomous looping, prefer prompt mode
-#     such as `copilot -p ...`, optionally with Copilot's own autopilot flags.
-#
-# LOOP OPTIONS
+# OPTIONS
 #     --max-iteration N
-#     --loop-max-iteration N
-#         Stop after N successful iterations. Default: 0 (unlimited)
+#         Stop after N iterations. Default: 0 (unlimited)
 #
 #     --completion-promise TEXT
-#     --loop-completion-promise TEXT
-#         Stop when TEXT appears in Copilot output
-#         Note: promise matching is best-effort for full-screen TUI sessions
+#         Stop when TEXT appears in Copilot's final response
 #
 #     --debug
-#     --loop-debug
 #         Enable copilot-loop debug logging
 #
 #     --help, -h
 #         Show this help message
 #
-#     All other options are passed through to copilot. To pass a flag that
-#     would otherwise be interpreted by copilot-loop, place it after `--`.
+#     All other options are passed through to copilot.
 #
 # EXAMPLES
 #     copilot-loop --max-iteration 5 -- -p "implement feature X"
-#     copilot-loop --completion-promise "DONE" -- -p "work until done"
-#     copilot-loop --max-iteration 1
-#     copilot-loop -- --help
+#     copilot-loop --completion-promise "DONE" -- -i "work until done"
+#     copilot-loop --max-iteration 3
 #
 # DEPENDENCIES
-#     - bash
-#     - copilot
-#     - script (only needed for interactive completion-promise capture)
+#     - copilot (GitHub Copilot CLI)
+#     - jq (JSON processor)
 #
 
 set -euo pipefail
 
-readonly WRAPPER_NAME="copilot-loop"
-readonly AGENT_NAME="GitHub Copilot CLI"
-: "${COPILOT_LOOP_BIN:=copilot}"
-readonly AGENT_BIN="$COPILOT_LOOP_BIN"
+readonly GITHUB_DIR="${PWD}/.github"
+readonly HOOKS_DIR="${GITHUB_DIR}/hooks"
+readonly STATE_FILE="${GITHUB_DIR}/copilot-loop.state.json"
+readonly HOOK_SCRIPT_PATH="${HOOKS_DIR}/copilot-loop-hook.sh"
+readonly HOOK_CONFIG_PATH="${HOOKS_DIR}/copilot-loop.json"
+readonly HOOK_LOG_FILE="${GITHUB_DIR}/copilot-loop-hook.log"
 
 ITERATION=1
 MAX_ITERATIONS=0
 COMPLETION_PROMISE=""
+COPILOT_ARGS=()
 DEBUG=false
-AGENT_ARGS=()
-TRANSCRIPT_FILE=""
 
-log() {
-  [[ "$DEBUG" == "true" ]] && printf '[%s] %s\n' "$WRAPPER_NAME" "$1" >&2 || true
+log() { [[ "$DEBUG" == "true" ]] && echo "[copilot-loop] $1" >&2 || true; }
+log_error() { echo "[copilot-loop] ERROR: $1" >&2; }
+
+check_dependencies() {
+  command -v jq >/dev/null 2>&1 || { log_error "jq is required but not installed."; exit 1; }
+  command -v copilot >/dev/null 2>&1 || { log_error "copilot CLI is required but not installed."; exit 1; }
 }
 
-log_error() {
-  printf '[%s] ERROR: %s\n' "$WRAPPER_NAME" "$1" >&2
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --max-iteration)      MAX_ITERATIONS="$2"; shift 2 ;;
+      --completion-promise) COMPLETION_PROMISE="$2"; shift 2 ;;
+      --debug)              DEBUG=true; shift ;;
+      --help|-h)            show_usage; exit 0 ;;
+      --)                   shift; COPILOT_ARGS+=("$@"); break ;;
+      *)                    COPILOT_ARGS+=("$1"); shift ;;
+    esac
+  done
+}
+
+write_state() {
+  local decision="${1:-null}"
+  local hook_called="${2:-false}"
+  local stop_reason="${3:-}"
+  mkdir -p "$GITHUB_DIR"
+  cat > "$STATE_FILE" << EOF
+{
+  "active": true,
+  "iteration": $ITERATION,
+  "max_iterations": $MAX_ITERATIONS,
+  "completion_promise": $(printf '%s' "$COMPLETION_PROMISE" | jq -Rs .),
+  "decision": $(if [ "$decision" = "null" ]; then echo "null"; else echo "\"$decision\""; fi),
+  "hook_called": $hook_called,
+  "stop_reason": $(printf '%s' "$stop_reason" | jq -Rs .)
+}
+EOF
+}
+
+read_decision() {
+  [[ -f "$STATE_FILE" ]] && jq -r '.decision // "null"' "$STATE_FILE" || echo "null"
+}
+
+read_iteration() {
+  [[ -f "$STATE_FILE" ]] && jq -r '.iteration // 1' "$STATE_FILE" || echo "1"
+}
+
+read_hook_called() {
+  [[ -f "$STATE_FILE" ]] && jq -r '.hook_called // false' "$STATE_FILE" || echo "false"
+}
+
+read_stop_reason() {
+  [[ -f "$STATE_FILE" ]] && jq -r '.stop_reason // ""' "$STATE_FILE" || echo ""
+}
+
+create_hook_script() {
+  mkdir -p "$HOOKS_DIR"
+  cat > "$HOOK_SCRIPT_PATH" << 'HOOKEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_FILE="${PWD}/.github/copilot-loop.state.json"
+DEBUG_FLAG_FILE="${PWD}/.github/copilot-loop.debug"
+HOOK_LOG_FILE="${PWD}/.github/copilot-loop-hook.log"
+
+debug_log() {
+  [[ -f "$DEBUG_FLAG_FILE" ]] || return 0
+  mkdir -p "$(dirname "$HOOK_LOG_FILE")"
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$HOOK_LOG_FILE"
+}
+
+extract_last_assistant_message() {
+  local transcript_path="$1"
+  [[ -n "$transcript_path" && -f "$transcript_path" ]] || return 0
+  jq -r '
+    select(.type == "assistant.message")
+    | .data.content // empty
+  ' "$transcript_path" 2>/dev/null | tail -n 1 || true
+}
+
+INPUT=$(cat)
+
+[[ ! -f "$STATE_FILE" ]] && exit 0
+
+STATE=$(cat "$STATE_FILE")
+[[ $(echo "$STATE" | jq -r '.active // false') != "true" ]] && exit 0
+
+TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcriptPath // empty')
+ITERATION=$(echo "$STATE" | jq -r '.iteration // 1')
+MAX_ITERATIONS=$(echo "$STATE" | jq -r '.max_iterations // 0')
+COMPLETION_PROMISE=$(echo "$STATE" | jq -r '.completion_promise // ""')
+ASSISTANT_TEXT=$(extract_last_assistant_message "$TRANSCRIPT_PATH")
+
+debug_log "agentStop hook started: iteration=$ITERATION max_iterations=$MAX_ITERATIONS transcript_path=${TRANSCRIPT_PATH:-<none>}"
+
+if [[ -n "$COMPLETION_PROMISE" ]] && [[ -n "$ASSISTANT_TEXT" ]] && grep -qF -- "$COMPLETION_PROMISE" <<< "$ASSISTANT_TEXT"; then
+  debug_log "decision=complete iteration=$ITERATION"
+  jq '.decision = "complete" | .hook_called = true | .stop_reason = "Completion promise matched."' \
+    "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+else
+  if [[ "$MAX_ITERATIONS" -gt 0 ]] && [[ "$ITERATION" -ge "$MAX_ITERATIONS" ]]; then
+    debug_log "decision=max_reached iteration=$ITERATION/$MAX_ITERATIONS"
+    jq '.decision = "max_reached" | .hook_called = true | .stop_reason = "Maximum iterations reached."' \
+      "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+  else
+    NEW_ITERATION=$((ITERATION + 1))
+    debug_log "decision=continue iteration=$ITERATION->$NEW_ITERATION"
+    jq --argjson iter "$NEW_ITERATION" '.iteration = $iter | .decision = "continue" | .hook_called = true | .stop_reason = ""' \
+      "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+  fi
+fi
+
+PARENT_PID=$(ps -o ppid= "$$" 2>/dev/null | tr -d ' ')
+GRANDPARENT_PID=""
+if [[ -n "$PARENT_PID" ]]; then
+  GRANDPARENT_PID=$(ps -o ppid= "$PARENT_PID" 2>/dev/null | tr -d ' ' || true)
+fi
+
+debug_log "sending SIGTERM to parent/copilot processes parent=${PARENT_PID:-<none>} grandparent=${GRANDPARENT_PID:-<none>}"
+[[ -n "$PARENT_PID" ]] && kill -TERM "$PARENT_PID" 2>/dev/null || true
+[[ -n "$GRANDPARENT_PID" ]] && kill -TERM "$GRANDPARENT_PID" 2>/dev/null || true
+
+printf '%s\n' '{"decision":"allow"}'
+exit 0
+HOOKEOF
+
+  chmod +x "$HOOK_SCRIPT_PATH"
+  cat > "$HOOK_CONFIG_PATH" << 'EOF'
+{
+  "version": 1,
+  "hooks": {
+    "agentStop": [
+      {
+        "type": "command",
+        "bash": "./.github/hooks/copilot-loop-hook.sh"
+      }
+    ]
+  }
+}
+EOF
+
+  if [[ "$DEBUG" == "true" ]]; then
+    touch "${GITHUB_DIR}/copilot-loop.debug"
+  fi
+}
+
+cleanup() {
+  local exit_code=$?
+  rm -f "$HOOK_SCRIPT_PATH"
+  rm -f "$HOOK_CONFIG_PATH"
+  rm -f "${GITHUB_DIR}/copilot-loop.debug"
+  rmdir "$HOOKS_DIR" 2>/dev/null || true
+  rm -f "$STATE_FILE"
+  exit "$exit_code"
 }
 
 show_usage() {
@@ -80,166 +220,67 @@ show_usage() {
   ' "$0"
 }
 
-check_dependencies() {
-  command -v "$AGENT_BIN" >/dev/null 2>&1 || {
-    log_error "$AGENT_NAME executable not found: $AGENT_BIN"
-    exit 1
-  }
+main() {
+  check_dependencies
+  parse_args "$@"
 
-  if [[ -n "$COMPLETION_PROMISE" ]] && [[ -t 0 && -t 1 ]]; then
-    command -v script >/dev/null 2>&1 || {
-      log_error "script is required for interactive completion-promise capture."
-      exit 1
-    }
-  fi
-}
-
-parse_args() {
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --max-iteration|--loop-max-iteration)
-        [[ $# -ge 2 ]] || {
-          log_error "$1 requires a value."
-          exit 1
-        }
-        MAX_ITERATIONS="$2"
-        shift 2
-        ;;
-      --completion-promise|--loop-completion-promise)
-        [[ $# -ge 2 ]] || {
-          log_error "$1 requires a value."
-          exit 1
-        }
-        COMPLETION_PROMISE="$2"
-        shift 2
-        ;;
-      --debug|--loop-debug)
-        DEBUG=true
-        shift
-        ;;
-      --help|-h)
-        show_usage
-        exit 0
-        ;;
-      --)
-        shift
-        AGENT_ARGS+=("$@")
-        break
-        ;;
-      *)
-        AGENT_ARGS+=("$1")
-        shift
-        ;;
-    esac
-  done
-}
-
-validate_config() {
   [[ "$MAX_ITERATIONS" =~ ^[0-9]+$ ]] || {
     log_error "max iteration must be a non-negative integer."
     exit 1
   }
-}
 
-setup_transcript_file() {
-  [[ -n "$COMPLETION_PROMISE" ]] || return 0
-  TRANSCRIPT_FILE="$(mktemp "${TMPDIR:-/tmp}/${WRAPPER_NAME}.XXXXXX")"
-}
-
-cleanup() {
-  local exit_code=$?
-  [[ -n "$TRANSCRIPT_FILE" ]] && rm -f "$TRANSCRIPT_FILE"
-  exit "$exit_code"
-}
-
-transcript_contains_promise() {
-  [[ -n "$COMPLETION_PROMISE" ]] || return 1
-  [[ -n "$TRANSCRIPT_FILE" && -f "$TRANSCRIPT_FILE" ]] || return 1
-
-  if LC_ALL=C grep -aFq -- "$COMPLETION_PROMISE" "$TRANSCRIPT_FILE"; then
-    return 0
-  fi
-
-  if command -v strings >/dev/null 2>&1; then
-    if LC_ALL=C strings -a -n 1 "$TRANSCRIPT_FILE" | grep -Fq -- "$COMPLETION_PROMISE"; then
-      return 0
-    fi
-  fi
-
-  return 1
-}
-
-run_agent_once() {
-  local exit_code
-
-  if [[ -n "$TRANSCRIPT_FILE" ]]; then
-    : > "$TRANSCRIPT_FILE"
-  fi
-
-  log "starting $AGENT_BIN (iteration $ITERATION)"
-
-  set +e
-  if [[ -n "$COMPLETION_PROMISE" ]]; then
-    if [[ -t 0 && -t 1 ]]; then
-      script -q "$TRANSCRIPT_FILE" "$AGENT_BIN" "${AGENT_ARGS[@]}"
-      exit_code=$?
-    else
-      "$AGENT_BIN" "${AGENT_ARGS[@]}" 2>&1 | tee "$TRANSCRIPT_FILE"
-      exit_code=${PIPESTATUS[0]}
-    fi
-  else
-    "$AGENT_BIN" "${AGENT_ARGS[@]}"
-    exit_code=$?
-  fi
-  set -e
-
-  log "$AGENT_BIN exited with code $exit_code"
-  return "$exit_code"
-}
-
-main() {
-  parse_args "$@"
-  validate_config
-  check_dependencies
-  setup_transcript_file
   trap cleanup EXIT INT TERM
 
-  if [[ "$MAX_ITERATIONS" -eq 0 ]] && [[ -z "$COMPLETION_PROMISE" ]]; then
-    log "no termination condition configured; the loop will continue until interrupted."
-  fi
+  log "max_iterations=$MAX_ITERATIONS completion_promise=${COMPLETION_PROMISE:-<none>}"
+
+  create_hook_script
 
   while true; do
-    local exit_code
+    write_state "null" "false"
+    log "starting copilot (iteration $ITERATION)"
+
     set +e
-    run_agent_once
-    exit_code=$?
+    copilot "${COPILOT_ARGS[@]}"
+    local copilot_exit_code=$?
     set -e
 
-    case "$exit_code" in
-      0)
+    local decision hook_called stop_reason
+    decision=$(read_decision)
+    hook_called=$(read_hook_called)
+    ITERATION=$(read_iteration)
+    stop_reason=$(read_stop_reason)
+
+    log "copilot exited (code=$copilot_exit_code, decision=$decision, hook=$hook_called, reason=${stop_reason:-<none>})"
+
+    if [[ "$decision" != "continue" ]]; then
+      case $copilot_exit_code in
+        129|130|137|143)
+          if [[ "$hook_called" != "true" ]]; then
+            log "interrupted by signal"
+            return "$copilot_exit_code"
+          fi
+          ;;
+      esac
+    fi
+
+    if [[ "$hook_called" != "true" ]]; then
+      log "hook not called; exiting with copilot's status"
+      return "$copilot_exit_code"
+    fi
+
+    case "$decision" in
+      complete|max_reached)
+        log "finished after $ITERATION iteration(s): ${stop_reason:-<none>}"
+        return 0
         ;;
-      129|130|137|143)
-        log "terminating on signal-like exit code: $exit_code"
-        return "$exit_code"
+      continue)
+        log "iteration $((ITERATION - 1)) complete, restarting copilot"
         ;;
       *)
-        log "terminating on non-zero exit code: $exit_code"
-        return "$exit_code"
+        log_error "unexpected decision: $decision"
+        return 1
         ;;
     esac
-
-    if transcript_contains_promise; then
-      log "completion promise matched after iteration $ITERATION"
-      return 0
-    fi
-
-    if [[ "$MAX_ITERATIONS" -gt 0 ]] && [[ "$ITERATION" -ge "$MAX_ITERATIONS" ]]; then
-      log "maximum iterations reached: $ITERATION"
-      return 0
-    fi
-
-    ITERATION=$((ITERATION + 1))
-    log "restarting $AGENT_BIN"
   done
 }
 
