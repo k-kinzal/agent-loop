@@ -20,6 +20,7 @@ Each iteration starts as a brand-new session. The agent picks up previous work t
 
 - `claude-loop` — Loop wrapper for Claude Code using Stop hooks
 - `codex-loop` — Standalone loop wrapper for Codex CLI using plain process restarts
+- `gemini-loop` — Standalone loop wrapper for Gemini CLI using plain process restarts
 
 ## Distribution requirement
 

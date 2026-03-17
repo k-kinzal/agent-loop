@@ -16,6 +16,7 @@ wrapper, not the agent, responsible for loop control.
 
 - `claude-loop`: Claude Code wrapper using Claude Stop hooks
 - `codex-loop`: Codex CLI wrapper for iterative process restarts
+- `gemini-loop`: Gemini CLI wrapper for iterative process restarts
 
 ## Installation
 
@@ -32,7 +33,7 @@ You can also clone the repository and install whichever scripts you need.
 ```bash
 git clone <repo-url>
 cd agent-loop
-chmod +x claude-loop codex-loop
+chmod +x claude-loop codex-loop gemini-loop
 ```
 
 ## Loop behavior
@@ -80,6 +81,14 @@ codex-loop -- --help
 - Uses plain process restarts rather than Codex-specific hooks
 - Interactive Codex sessions launch correctly, but reliable autonomous looping
   requires a Codex mode that exits on completion, such as `codex exec`
+
+### `gemini-loop`
+
+- Depends on `gemini`
+- Uses plain process restarts rather than Gemini-specific hooks
+- Gemini positional prompts are one-shot by default, which fits the loop model
+- `-i/--prompt-interactive` launches an interactive session, but the wrapper
+  can only continue after that session exits
 
 ## Development
 
