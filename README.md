@@ -89,10 +89,11 @@ codex-loop -- --help
 ### `gemini-loop`
 
 - Depends on `gemini`
-- Uses plain process restarts rather than Gemini-specific hooks
-- Gemini positional prompts are one-shot by default, which fits the loop model
-- `-i/--prompt-interactive` launches an interactive session, but the wrapper
-  can only continue after that session exits
+- Depends on `jq`
+- Uses a temporary Gemini `AfterAgent` hook to end each session and restart
+  Gemini as a fresh process
+- Gemini positional prompts are one-shot by default, and interactive
+  `-i/--prompt-interactive` sessions are also loopable via the hook
 
 ### `copilot-loop`
 

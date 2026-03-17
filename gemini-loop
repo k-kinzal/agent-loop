@@ -1,73 +1,219 @@
 #!/usr/bin/env bash
 #
-# gemini-loop - Run Gemini CLI in a managed restart loop
+# gemini-loop - Run Gemini CLI in a managed AfterAgent-hook loop
 #
 # USAGE
-#     gemini-loop [LOOP_OPTIONS] [--] [GEMINI_ARGS...]
+#     gemini-loop [OPTIONS] [--] [GEMINI_ARGS...]
 #
 # DESCRIPTION
-#     Launches Gemini CLI as a fresh process on each iteration. When Gemini
-#     exits successfully, gemini-loop decides whether to stop or start a new
-#     Gemini process.
+#     Runs Gemini CLI under a managed AfterAgent hook until a termination
+#     condition is met. The hook ends each Gemini session after a completed
+#     agent turn, allowing gemini-loop to restart Gemini as a fresh process for
+#     the next iteration.
 #
-#     Interactive Gemini sessions are supported, but the loop can only continue
-#     after Gemini exits. For autonomous looping, prefer Gemini's one-shot
-#     prompt mode. Gemini positional prompts are one-shot by default; use
-#     `-i/--prompt-interactive` only when you explicitly want an interactive
-#     session to remain open after the first prompt.
-#
-# LOOP OPTIONS
+# OPTIONS
 #     --max-iteration N
-#     --loop-max-iteration N
-#         Stop after N successful iterations. Default: 0 (unlimited)
+#         Stop after N iterations. Default: 0 (unlimited)
 #
 #     --completion-promise TEXT
-#     --loop-completion-promise TEXT
-#         Stop when TEXT appears in Gemini output
-#         Note: promise matching is best-effort for full-screen TUI sessions
+#         Stop when TEXT appears in Gemini's final response for an iteration
 #
 #     --debug
-#     --loop-debug
 #         Enable gemini-loop debug logging
 #
 #     --help, -h
 #         Show this help message
 #
-#     All other options are passed through to gemini. To pass a flag that would
-#     otherwise be interpreted by gemini-loop, place it after `--`.
+#     All other options are passed through to gemini.
 #
 # EXAMPLES
 #     gemini-loop --max-iteration 5 -- "implement feature X"
-#     gemini-loop --completion-promise "DONE" -- -p "work until done"
-#     gemini-loop --max-iteration 1
-#     gemini-loop -- --help
+#     gemini-loop --completion-promise "DONE" -- "work until done"
+#     gemini-loop --max-iteration 3 -- -i "say hello"
 #
 # DEPENDENCIES
-#     - bash
-#     - gemini
-#     - script (only needed for interactive completion-promise capture)
+#     - gemini (Gemini CLI)
+#     - jq (JSON processor)
 #
 
 set -euo pipefail
 
-readonly WRAPPER_NAME="gemini-loop"
-readonly AGENT_NAME="Gemini CLI"
-: "${GEMINI_LOOP_BIN:=gemini}"
-readonly AGENT_BIN="$GEMINI_LOOP_BIN"
+readonly GEMINI_DIR="${PWD}/.gemini"
+readonly HOOKS_DIR="${GEMINI_DIR}/hooks"
+readonly STATE_FILE="${GEMINI_DIR}/gemini-loop.state.json"
+readonly SETTINGS_PROJECT="${GEMINI_DIR}/settings.json"
+readonly HOOK_SCRIPT_PATH="${HOOKS_DIR}/gemini-loop-hook.sh"
+readonly HOOK_LOG_FILE="${GEMINI_DIR}/gemini-loop-hook.log"
 
 ITERATION=1
 MAX_ITERATIONS=0
 COMPLETION_PROMISE=""
+GEMINI_ARGS=()
+SETTINGS_MODIFIED=false
+TARGET_SETTINGS_BACKUP=""
 DEBUG=false
-AGENT_ARGS=()
-TRANSCRIPT_FILE=""
 
-log() {
-  [[ "$DEBUG" == "true" ]] && printf '[%s] %s\n' "$WRAPPER_NAME" "$1" >&2 || true
+log() { [[ "$DEBUG" == "true" ]] && echo "[gemini-loop] $1" >&2 || true; }
+log_error() { echo "[gemini-loop] ERROR: $1" >&2; }
+
+check_dependencies() {
+  command -v jq >/dev/null 2>&1 || { log_error "jq is required but not installed."; exit 1; }
+  command -v gemini >/dev/null 2>&1 || { log_error "gemini CLI is required but not installed."; exit 1; }
 }
 
-log_error() {
-  printf '[%s] ERROR: %s\n' "$WRAPPER_NAME" "$1" >&2
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --max-iteration)      MAX_ITERATIONS="$2"; shift 2 ;;
+      --completion-promise) COMPLETION_PROMISE="$2"; shift 2 ;;
+      --debug)              DEBUG=true; shift ;;
+      --help|-h)            show_usage; exit 0 ;;
+      --)                   shift; GEMINI_ARGS+=("$@"); break ;;
+      *)                    GEMINI_ARGS+=("$1"); shift ;;
+    esac
+  done
+}
+
+write_state() {
+  local decision="${1:-null}"
+  local hook_called="${2:-false}"
+  local stop_reason="${3:-}"
+  mkdir -p "$GEMINI_DIR"
+  cat > "$STATE_FILE" << EOF
+{
+  "active": true,
+  "iteration": $ITERATION,
+  "max_iterations": $MAX_ITERATIONS,
+  "completion_promise": $(printf '%s' "$COMPLETION_PROMISE" | jq -Rs .),
+  "decision": $(if [ "$decision" = "null" ]; then echo "null"; else echo "\"$decision\""; fi),
+  "hook_called": $hook_called,
+  "stop_reason": $(printf '%s' "$stop_reason" | jq -Rs .)
+}
+EOF
+}
+
+read_decision() {
+  [[ -f "$STATE_FILE" ]] && jq -r '.decision // "null"' "$STATE_FILE" || echo "null"
+}
+
+read_iteration() {
+  [[ -f "$STATE_FILE" ]] && jq -r '.iteration // 1' "$STATE_FILE" || echo "1"
+}
+
+read_hook_called() {
+  [[ -f "$STATE_FILE" ]] && jq -r '.hook_called // false' "$STATE_FILE" || echo "false"
+}
+
+read_stop_reason() {
+  [[ -f "$STATE_FILE" ]] && jq -r '.stop_reason // ""' "$STATE_FILE" || echo ""
+}
+
+create_hook_script() {
+  mkdir -p "$HOOKS_DIR"
+  cat > "$HOOK_SCRIPT_PATH" << 'HOOKEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_FILE="${GEMINI_PROJECT_DIR}/.gemini/gemini-loop.state.json"
+DEBUG_FLAG_FILE="${GEMINI_PROJECT_DIR}/.gemini/gemini-loop.debug"
+HOOK_LOG_FILE="${GEMINI_PROJECT_DIR}/.gemini/gemini-loop-hook.log"
+
+debug_log() {
+  [[ -f "$DEBUG_FLAG_FILE" ]] || return 0
+  mkdir -p "$(dirname "$HOOK_LOG_FILE")"
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$HOOK_LOG_FILE"
+}
+
+INPUT=$(cat)
+
+[[ ! -f "$STATE_FILE" ]] && exit 0
+
+STATE=$(cat "$STATE_FILE")
+[[ $(echo "$STATE" | jq -r '.active // false') != "true" ]] && exit 0
+
+ITERATION=$(echo "$STATE" | jq -r '.iteration // 1')
+MAX_ITERATIONS=$(echo "$STATE" | jq -r '.max_iterations // 0')
+COMPLETION_PROMISE=$(echo "$STATE" | jq -r '.completion_promise // ""')
+PROMPT_RESPONSE=$(echo "$INPUT" | jq -r '.prompt_response // empty')
+
+debug_log "AfterAgent hook started: iteration=$ITERATION max_iterations=$MAX_ITERATIONS"
+
+if [[ -n "$COMPLETION_PROMISE" ]] && [[ -n "$PROMPT_RESPONSE" ]] && grep -qF -- "$COMPLETION_PROMISE" <<< "$PROMPT_RESPONSE"; then
+  debug_log "decision=complete iteration=$ITERATION"
+  jq '.decision = "complete" | .hook_called = true | .stop_reason = "Completion promise matched."' \
+    "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+  printf '%s\n' '{"continue": false}'
+  exit 0
+fi
+
+if [[ "$MAX_ITERATIONS" -gt 0 ]] && [[ "$ITERATION" -ge "$MAX_ITERATIONS" ]]; then
+  debug_log "decision=max_reached iteration=$ITERATION/$MAX_ITERATIONS"
+  jq '.decision = "max_reached" | .hook_called = true | .stop_reason = "Maximum iterations reached."' \
+    "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+  printf '%s\n' '{"continue": false}'
+  exit 0
+fi
+
+NEW_ITERATION=$((ITERATION + 1))
+debug_log "decision=continue iteration=$ITERATION->$NEW_ITERATION"
+jq --argjson iter "$NEW_ITERATION" '.iteration = $iter | .decision = "continue" | .hook_called = true | .stop_reason = ""' \
+  "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+printf '%s\n' '{"continue": false}'
+exit 0
+HOOKEOF
+
+  chmod +x "$HOOK_SCRIPT_PATH"
+  if [[ "$DEBUG" == "true" ]]; then
+    touch "${GEMINI_DIR}/gemini-loop.debug"
+  fi
+}
+
+merge_settings() {
+  mkdir -p "$GEMINI_DIR"
+  TARGET_SETTINGS_BACKUP="${SETTINGS_PROJECT}.gemini-loop-backup"
+
+  local hook_entry='{"matcher":"*","hooks":[{"name":"gemini-loop","type":"command","command":"\"$GEMINI_PROJECT_DIR\"/.gemini/hooks/gemini-loop-hook.sh"}]}'
+
+  if [[ -f "$SETTINGS_PROJECT" ]]; then
+    cp "$SETTINGS_PROJECT" "$TARGET_SETTINGS_BACKUP"
+    jq --argjson hook "$hook_entry" '
+      if .hooks.AfterAgent then
+        .hooks.AfterAgent += [$hook]
+      elif .hooks then
+        .hooks.AfterAgent = [$hook]
+      else
+        . + {"hooks":{"AfterAgent":[$hook]}}
+      end
+    ' "$SETTINGS_PROJECT" > "${SETTINGS_PROJECT}.tmp" && mv "${SETTINGS_PROJECT}.tmp" "$SETTINGS_PROJECT"
+  else
+    cat > "$SETTINGS_PROJECT" << 'EOF'
+{"hooks":{"AfterAgent":[{"matcher":"*","hooks":[{"name":"gemini-loop","type":"command","command":"\"$GEMINI_PROJECT_DIR\"/.gemini/hooks/gemini-loop-hook.sh"}]}]}}
+EOF
+  fi
+
+  SETTINGS_MODIFIED=true
+  log "AfterAgent hook registered in settings.json"
+}
+
+restore_settings() {
+  if [[ "$SETTINGS_MODIFIED" == "true" ]]; then
+    if [[ -f "$TARGET_SETTINGS_BACKUP" ]]; then
+      mv "$TARGET_SETTINGS_BACKUP" "$SETTINGS_PROJECT"
+    else
+      rm -f "$SETTINGS_PROJECT"
+    fi
+    SETTINGS_MODIFIED=false
+  fi
+}
+
+cleanup() {
+  local exit_code=$?
+  rm -f "$HOOK_SCRIPT_PATH"
+  rm -f "${GEMINI_DIR}/gemini-loop.debug"
+  rmdir "$HOOKS_DIR" 2>/dev/null || true
+  restore_settings
+  rm -f "$STATE_FILE"
+  exit "$exit_code"
 }
 
 show_usage() {
@@ -82,166 +228,57 @@ show_usage() {
   ' "$0"
 }
 
-check_dependencies() {
-  command -v "$AGENT_BIN" >/dev/null 2>&1 || {
-    log_error "$AGENT_NAME executable not found: $AGENT_BIN"
-    exit 1
-  }
+main() {
+  check_dependencies
+  parse_args "$@"
 
-  if [[ -n "$COMPLETION_PROMISE" ]] && [[ -t 0 && -t 1 ]]; then
-    command -v script >/dev/null 2>&1 || {
-      log_error "script is required for interactive completion-promise capture."
-      exit 1
-    }
-  fi
-}
-
-parse_args() {
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --max-iteration|--loop-max-iteration)
-        [[ $# -ge 2 ]] || {
-          log_error "$1 requires a value."
-          exit 1
-        }
-        MAX_ITERATIONS="$2"
-        shift 2
-        ;;
-      --completion-promise|--loop-completion-promise)
-        [[ $# -ge 2 ]] || {
-          log_error "$1 requires a value."
-          exit 1
-        }
-        COMPLETION_PROMISE="$2"
-        shift 2
-        ;;
-      --debug|--loop-debug)
-        DEBUG=true
-        shift
-        ;;
-      --help|-h)
-        show_usage
-        exit 0
-        ;;
-      --)
-        shift
-        AGENT_ARGS+=("$@")
-        break
-        ;;
-      *)
-        AGENT_ARGS+=("$1")
-        shift
-        ;;
-    esac
-  done
-}
-
-validate_config() {
   [[ "$MAX_ITERATIONS" =~ ^[0-9]+$ ]] || {
     log_error "max iteration must be a non-negative integer."
     exit 1
   }
-}
 
-setup_transcript_file() {
-  [[ -n "$COMPLETION_PROMISE" ]] || return 0
-  TRANSCRIPT_FILE="$(mktemp "${TMPDIR:-/tmp}/${WRAPPER_NAME}.XXXXXX")"
-}
-
-cleanup() {
-  local exit_code=$?
-  [[ -n "$TRANSCRIPT_FILE" ]] && rm -f "$TRANSCRIPT_FILE"
-  exit "$exit_code"
-}
-
-transcript_contains_promise() {
-  [[ -n "$COMPLETION_PROMISE" ]] || return 1
-  [[ -n "$TRANSCRIPT_FILE" && -f "$TRANSCRIPT_FILE" ]] || return 1
-
-  if LC_ALL=C grep -aFq -- "$COMPLETION_PROMISE" "$TRANSCRIPT_FILE"; then
-    return 0
-  fi
-
-  if command -v strings >/dev/null 2>&1; then
-    if LC_ALL=C strings -a -n 1 "$TRANSCRIPT_FILE" | grep -Fq -- "$COMPLETION_PROMISE"; then
-      return 0
-    fi
-  fi
-
-  return 1
-}
-
-run_agent_once() {
-  local exit_code
-
-  if [[ -n "$TRANSCRIPT_FILE" ]]; then
-    : > "$TRANSCRIPT_FILE"
-  fi
-
-  log "starting $AGENT_BIN (iteration $ITERATION)"
-
-  set +e
-  if [[ -n "$COMPLETION_PROMISE" ]]; then
-    if [[ -t 0 && -t 1 ]]; then
-      script -q "$TRANSCRIPT_FILE" "$AGENT_BIN" "${AGENT_ARGS[@]}"
-      exit_code=$?
-    else
-      "$AGENT_BIN" "${AGENT_ARGS[@]}" 2>&1 | tee "$TRANSCRIPT_FILE"
-      exit_code=${PIPESTATUS[0]}
-    fi
-  else
-    "$AGENT_BIN" "${AGENT_ARGS[@]}"
-    exit_code=$?
-  fi
-  set -e
-
-  log "$AGENT_BIN exited with code $exit_code"
-  return "$exit_code"
-}
-
-main() {
-  parse_args "$@"
-  validate_config
-  check_dependencies
-  setup_transcript_file
   trap cleanup EXIT INT TERM
 
-  if [[ "$MAX_ITERATIONS" -eq 0 ]] && [[ -z "$COMPLETION_PROMISE" ]]; then
-    log "no termination condition configured; the loop will continue until interrupted."
-  fi
+  log "max_iterations=$MAX_ITERATIONS completion_promise=${COMPLETION_PROMISE:-<none>}"
+
+  create_hook_script
+  merge_settings
 
   while true; do
-    local exit_code
+    write_state "null" "false"
+    log "starting gemini (iteration $ITERATION)"
+
     set +e
-    run_agent_once
-    exit_code=$?
+    gemini "${GEMINI_ARGS[@]}"
+    local gemini_exit_code=$?
     set -e
 
-    case "$exit_code" in
-      0)
+    local decision hook_called stop_reason
+    decision=$(read_decision)
+    hook_called=$(read_hook_called)
+    ITERATION=$(read_iteration)
+    stop_reason=$(read_stop_reason)
+
+    log "gemini exited (code=$gemini_exit_code, decision=$decision, hook=$hook_called, reason=${stop_reason:-<none>})"
+
+    if [[ "$hook_called" != "true" ]]; then
+      log "hook not called; exiting with gemini's status"
+      return "$gemini_exit_code"
+    fi
+
+    case "$decision" in
+      complete|max_reached)
+        log "finished after $ITERATION iteration(s): ${stop_reason:-<none>}"
+        return 0
         ;;
-      129|130|137|143)
-        log "terminating on signal-like exit code: $exit_code"
-        return "$exit_code"
+      continue)
+        log "iteration $((ITERATION - 1)) complete, restarting gemini"
         ;;
       *)
-        log "terminating on non-zero exit code: $exit_code"
-        return "$exit_code"
+        log_error "unexpected decision: $decision"
+        return 1
         ;;
     esac
-
-    if transcript_contains_promise; then
-      log "completion promise matched after iteration $ITERATION"
-      return 0
-    fi
-
-    if [[ "$MAX_ITERATIONS" -gt 0 ]] && [[ "$ITERATION" -ge "$MAX_ITERATIONS" ]]; then
-      log "maximum iterations reached: $ITERATION"
-      return 0
-    fi
-
-    ITERATION=$((ITERATION + 1))
-    log "restarting $AGENT_BIN"
   done
 }
 
