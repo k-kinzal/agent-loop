@@ -18,6 +18,7 @@ wrapper, not the agent, responsible for loop control.
 - `codex-loop`: Codex CLI wrapper for iterative process restarts
 - `gemini-loop`: Gemini CLI wrapper for iterative process restarts
 - `copilot-loop`: GitHub Copilot CLI wrapper for iterative process restarts
+- `cursor-loop`: Cursor Agent CLI wrapper for iterative process restarts
 
 ## Installation
 
@@ -34,7 +35,7 @@ You can also clone the repository and install whichever scripts you need.
 ```bash
 git clone <repo-url>
 cd agent-loop
-chmod +x claude-loop codex-loop gemini-loop copilot-loop
+chmod +x claude-loop codex-loop gemini-loop copilot-loop cursor-loop
 ```
 
 ## Loop behavior
@@ -98,6 +99,14 @@ codex-loop -- --help
 - Reliable autonomous looping is best with `copilot -p ...`
 - Interactive mode is still launchable, but the next iteration only starts
   after Copilot exits
+
+### `cursor-loop`
+
+- Depends on `cursor-agent`
+- Uses plain process restarts rather than Cursor-specific hooks
+- Reliable autonomous looping is best with `cursor-agent --print ...`
+- Interactive Cursor Agent sessions still launch, but the wrapper cannot start
+  the next iteration until the session exits
 
 ## Development
 
