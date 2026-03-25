@@ -1,0 +1,552 @@
+#!/usr/bin/env bash
+#
+# claude-watch - Run Claude Code on file changes
+#
+# USAGE
+#     claude-watch [OPTIONS] [--] [CLAUDE_ARGS...]
+#
+# DESCRIPTION
+#     Watches directories for file creation and modification, then launches
+#     Claude Code in response. When Claude finishes its work, the watcher
+#     returns to monitoring. A cooldown prevents over-triggering from rapid
+#     saves.
+#
+#     Uses Claude's Stop hook mechanism to ensure Claude exits after each
+#     trigger, supporting both -p (print) and interactive modes.
+#
+# OPTIONS
+#     --watch-dir DIR
+#         Directory to watch recursively (repeatable, required)
+#
+#     --cooldown N
+#         Minimum seconds between Claude runs. Default: 30
+#
+#     --per-file
+#         Run Claude once per changed file instead of once per batch.
+#         Default: batch mode (one Claude run for all changed files)
+#
+#     --completion-promise TEXT
+#         Stop the watcher when TEXT appears in Claude's output
+#
+#     --max-triggers N
+#         Maximum number of triggers before exiting. Default: 0 (unlimited)
+#
+#     --ignore PATTERN
+#         Additional glob pattern to ignore (repeatable)
+#
+#     --debug
+#         Enable debug logging (both claude-watch and claude)
+#
+#     --help, -h
+#         Show this help message
+#
+#     All other options are passed through to claude.
+#
+# TEMPLATE VARIABLES
+#     {{files}}   Replaced with the list of changed file paths (space-separated)
+#     {{file}}    Replaced with a single file path (per-file mode)
+#
+#     Templates are expanded in all arguments passed to claude. When no
+#     template variable is present, claude receives the arguments as-is.
+#
+# EXAMPLES
+#     claude-watch --watch-dir ./src -- -p "describe what changed in {{files}}"
+#     claude-watch --watch-dir ./src --per-file -- -p "review {{file}}"
+#     claude-watch --watch-dir ./src --cooldown 10 "review recent changes"
+#     claude-watch --watch-dir ./src --watch-dir ./tests --max-triggers 5 "fix issues"
+#     claude-watch --watch-dir . --ignore "*.log" --completion-promise "DONE" "work"
+#
+# DEPENDENCIES
+#     - claude (Claude Code CLI)
+#     - jq (JSON processor)
+#     - fswatch (recommended; falls back to find -newer polling)
+#
+
+set -euo pipefail
+
+readonly CLAUDE_DIR="${PWD}/.claude"
+readonly HOOKS_DIR="${CLAUDE_DIR}/hooks"
+readonly STATE_FILE="${CLAUDE_DIR}/claude-watch.state.json"
+readonly SETTINGS_LOCAL="${CLAUDE_DIR}/settings.local.json"
+readonly SETTINGS_PROJECT="${CLAUDE_DIR}/settings.json"
+readonly HOOK_SCRIPT_PATH="${HOOKS_DIR}/claude-watch-hook.sh"
+readonly HOOK_LOG_FILE="${CLAUDE_DIR}/claude-watch-hook.log"
+readonly EXISTING_HOOKS_FILE="${CLAUDE_DIR}/claude-watch-existing-hooks.json"
+
+WATCH_DIRS=()
+IGNORE_PATTERNS=()
+COOLDOWN_SECONDS=30
+MAX_TRIGGERS=0
+COMPLETION_PROMISE=""
+CLAUDE_ARGS=()
+SETTINGS_MODIFIED=false
+TARGET_SETTINGS_FILE=""
+TARGET_SETTINGS_BACKUP=""
+DEBUG=false
+TRIGGER_COUNT=0
+LAST_RUN_TIMESTAMP=0
+SENTINEL_FILE=""
+USE_FSWATCH=false
+PER_FILE=false
+CHANGED_FILES=""
+
+log() { [[ "$DEBUG" == "true" ]] && echo "[claude-watch] $1" >&2 || true; }
+log_error() { echo "[claude-watch] ERROR: $1" >&2; }
+
+check_dependencies() {
+  command -v jq &>/dev/null || { log_error "jq is required but not installed."; exit 1; }
+  command -v claude &>/dev/null || { log_error "claude CLI is required but not installed."; exit 1; }
+  if command -v fswatch &>/dev/null; then
+    USE_FSWATCH=true
+    log "using fswatch for file monitoring"
+  else
+    log "fswatch not found; falling back to find -newer polling"
+  fi
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --watch-dir)
+        [[ $# -ge 2 ]] || { log_error "--watch-dir requires a value."; exit 1; }
+        WATCH_DIRS+=("$2"); shift 2 ;;
+      --cooldown)
+        [[ $# -ge 2 ]] || { log_error "--cooldown requires a value."; exit 1; }
+        COOLDOWN_SECONDS="$2"; shift 2 ;;
+      --completion-promise)
+        [[ $# -ge 2 ]] || { log_error "--completion-promise requires a value."; exit 1; }
+        COMPLETION_PROMISE="$2"; shift 2 ;;
+      --max-triggers)
+        [[ $# -ge 2 ]] || { log_error "--max-triggers requires a value."; exit 1; }
+        MAX_TRIGGERS="$2"; shift 2 ;;
+      --per-file)
+        PER_FILE=true; shift ;;
+      --ignore)
+        [[ $# -ge 2 ]] || { log_error "--ignore requires a value."; exit 1; }
+        IGNORE_PATTERNS+=("$2"); shift 2 ;;
+      --debug)
+        DEBUG=true; CLAUDE_ARGS+=("$1"); shift ;;
+      --)
+        shift; CLAUDE_ARGS+=("$@"); break ;;
+      *)
+        CLAUDE_ARGS+=("$1"); shift ;;
+    esac
+  done
+}
+
+validate_config() {
+  [[ ${#WATCH_DIRS[@]} -gt 0 ]] || { log_error "--watch-dir is required."; exit 1; }
+  [[ "$COOLDOWN_SECONDS" =~ ^[0-9]+$ ]] || { log_error "cooldown must be a non-negative integer."; exit 1; }
+  [[ "$MAX_TRIGGERS" =~ ^[0-9]+$ ]] || { log_error "max-triggers must be a non-negative integer."; exit 1; }
+  local normalized=()
+  for dir in "${WATCH_DIRS[@]}"; do
+    dir="${dir%/}"
+    [[ -d "$dir" ]] || { log_error "watch directory does not exist: $dir"; exit 1; }
+    normalized+=("$dir")
+  done
+  WATCH_DIRS=("${normalized[@]}")
+}
+
+write_state() {
+  local decision="${1:-null}"
+  local hook_called="${2:-false}"
+  mkdir -p "$CLAUDE_DIR"
+  cat > "$STATE_FILE" << EOF
+{
+  "active": true,
+  "completion_promise": $(printf '%s' "$COMPLETION_PROMISE" | jq -Rs .),
+  "decision": $(if [ "$decision" = "null" ]; then echo "null"; else echo "\"$decision\""; fi),
+  "hook_called": $hook_called
+}
+EOF
+}
+
+read_decision() {
+  [[ -f "$STATE_FILE" ]] && jq -r '.decision // "null"' "$STATE_FILE" || echo "null"
+}
+
+read_hook_called() {
+  [[ -f "$STATE_FILE" ]] && jq -r '.hook_called // false' "$STATE_FILE" || echo "false"
+}
+
+create_hook_script() {
+  mkdir -p "$HOOKS_DIR"
+  cat > "$HOOK_SCRIPT_PATH" << 'HOOKEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_FILE="${CLAUDE_PROJECT_DIR}/.claude/claude-watch.state.json"
+DEBUG_FLAG_FILE="${CLAUDE_PROJECT_DIR}/.claude/claude-watch.debug"
+HOOK_LOG_FILE="${CLAUDE_PROJECT_DIR}/.claude/claude-watch-hook.log"
+EXISTING_HOOKS_FILE="${CLAUDE_PROJECT_DIR}/.claude/claude-watch-existing-hooks.json"
+
+debug_log() {
+  [[ -f "$DEBUG_FLAG_FILE" ]] || return 0
+  mkdir -p "$(dirname "$HOOK_LOG_FILE")"
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$HOOK_LOG_FILE"
+}
+
+INPUT=$(cat)
+
+# Run existing hooks first; if any blocks stop, defer to it
+if [[ -f "$EXISTING_HOOKS_FILE" ]] && [[ "$(jq 'length' "$EXISTING_HOOKS_FILE")" -gt 0 ]]; then
+  HOOK_COUNT=$(jq 'length' "$EXISTING_HOOKS_FILE")
+  debug_log "Running $HOOK_COUNT existing hook(s) before claude-watch logic"
+  for ((i=0; i<HOOK_COUNT; i++)); do
+    HOOK_CMD=$(jq -r ".[$i]" "$EXISTING_HOOKS_FILE")
+    debug_log "Running existing hook $((i+1))/$HOOK_COUNT: $HOOK_CMD"
+    RESULT=""
+    RESULT=$(printf '%s' "$INPUT" | eval "$HOOK_CMD" 2>/dev/null) || true
+    if [[ -n "$RESULT" ]]; then
+      HOOK_CONTINUE=$(printf '%s' "$RESULT" | jq -r '.continue // "null"' 2>/dev/null) || HOOK_CONTINUE="null"
+      if [[ "$HOOK_CONTINUE" != "false" ]]; then
+        debug_log "Existing hook $((i+1)) blocked stop (continue=$HOOK_CONTINUE), forwarding with continue=true"
+        printf '%s' "$RESULT" | jq -c '. + {"continue": true}'
+        exit 0
+      fi
+    fi
+    debug_log "Existing hook $((i+1)) passed"
+  done
+  debug_log "All $HOOK_COUNT existing hook(s) passed, proceeding with claude-watch logic"
+fi
+
+[[ ! -f "$STATE_FILE" ]] && exit 0
+
+STATE=$(cat "$STATE_FILE")
+[[ $(echo "$STATE" | jq -r '.active // false') != "true" ]] && exit 0
+
+COMPLETION_PROMISE=$(echo "$STATE" | jq -r '.completion_promise // ""')
+LAST_ASSISTANT_MESSAGE=$(echo "$INPUT" | jq -r '.last_assistant_message // empty')
+TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path // empty')
+ASSISTANT_TEXT="$LAST_ASSISTANT_MESSAGE"
+
+debug_log "Stop hook started: completion_promise=${COMPLETION_PROMISE:-<none>} transcript_path=${TRANSCRIPT_PATH:-<none>}"
+
+if [[ -z "$ASSISTANT_TEXT" ]] && [[ -n "$TRANSCRIPT_PATH" ]] && [[ -f "$TRANSCRIPT_PATH" ]]; then
+  ASSISTANT_TEXT=$(jq -r '
+    select(.type == "assistant")
+    | .message.content[]?
+    | select(.type == "text")
+    | .text // empty
+  ' "$TRANSCRIPT_PATH" 2>/dev/null | tail -n 1 || true)
+fi
+
+DECISION="done"
+if [[ -n "$COMPLETION_PROMISE" ]] && [[ -n "$ASSISTANT_TEXT" ]] && grep -qF -- "$COMPLETION_PROMISE" <<< "$ASSISTANT_TEXT"; then
+  DECISION="complete"
+  debug_log "decision=complete (completion promise matched)"
+else
+  debug_log "decision=done"
+fi
+
+jq --arg d "$DECISION" '.decision = $d | .hook_called = true' \
+  "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+
+# Terminate Claude process so the wrapper regains control
+CLAUDE_PID=$(ps -o ppid= $$ 2>/dev/null | tr -d ' ')
+if [[ -n "$CLAUDE_PID" ]]; then
+  debug_log "sending SIGTERM to claude process (PID=$CLAUDE_PID)"
+  kill -TERM "$CLAUDE_PID" 2>/dev/null || true
+fi
+exit 0
+HOOKEOF
+
+  chmod +x "$HOOK_SCRIPT_PATH"
+  if [[ "$DEBUG" == "true" ]]; then
+    touch "${CLAUDE_DIR}/claude-watch.debug"
+  fi
+}
+
+extract_existing_stop_hooks() {
+  local hooks_json="[]"
+  if [[ -f "$TARGET_SETTINGS_FILE" ]] && jq -e '.hooks.Stop' "$TARGET_SETTINGS_FILE" &>/dev/null; then
+    hooks_json=$(jq '[.hooks.Stop[]?.hooks[]? | select(.type == "command") | .command]' "$TARGET_SETTINGS_FILE")
+  fi
+  echo "$hooks_json" > "$EXISTING_HOOKS_FILE"
+  log "extracted existing stop hooks: $(cat "$EXISTING_HOOKS_FILE")"
+}
+
+merge_settings() {
+  mkdir -p "$CLAUDE_DIR"
+
+  local hook_entry='{"hooks":[{"type":"command","command":"\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/claude-watch-hook.sh"}]}'
+
+  if [[ -f "$SETTINGS_PROJECT" ]] && jq -e '.hooks.Stop' "$SETTINGS_PROJECT" &>/dev/null; then
+    TARGET_SETTINGS_FILE="$SETTINGS_PROJECT"
+  else
+    TARGET_SETTINGS_FILE="$SETTINGS_LOCAL"
+  fi
+  TARGET_SETTINGS_BACKUP="${TARGET_SETTINGS_FILE}.claude-watch-backup"
+
+  if [[ -f "$TARGET_SETTINGS_FILE" ]]; then
+    cp "$TARGET_SETTINGS_FILE" "$TARGET_SETTINGS_BACKUP"
+  fi
+
+  extract_existing_stop_hooks
+
+  if [[ -f "$TARGET_SETTINGS_FILE" ]]; then
+    local existing
+    existing=$(cat "$TARGET_SETTINGS_FILE")
+
+    if echo "$existing" | jq -e '.hooks' &>/dev/null; then
+      echo "$existing" | jq --argjson hook "$hook_entry" '.hooks.Stop = [$hook]' > "$TARGET_SETTINGS_FILE"
+    else
+      echo "$existing" | jq --argjson hook "$hook_entry" '.hooks = {"Stop": [$hook]}' > "$TARGET_SETTINGS_FILE"
+    fi
+  else
+    cat > "$TARGET_SETTINGS_FILE" << 'EOF'
+{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/claude-watch-hook.sh"}]}]}}
+EOF
+  fi
+
+  SETTINGS_MODIFIED=true
+  log "hook registered in $(basename "$TARGET_SETTINGS_FILE")"
+}
+
+restore_settings() {
+  if [[ "$SETTINGS_MODIFIED" == "true" ]] && [[ -n "$TARGET_SETTINGS_FILE" ]]; then
+    if [[ -f "$TARGET_SETTINGS_BACKUP" ]]; then
+      mv "$TARGET_SETTINGS_BACKUP" "$TARGET_SETTINGS_FILE"
+    else
+      rm -f "$TARGET_SETTINGS_FILE"
+    fi
+    SETTINGS_MODIFIED=false
+  fi
+}
+
+cleanup() {
+  local exit_code=$?
+  rm -f "$HOOK_SCRIPT_PATH"
+  rm -f "${CLAUDE_DIR}/claude-watch.debug"
+  rm -f "$EXISTING_HOOKS_FILE"
+  rm -f "$HOOK_LOG_FILE"
+  rmdir "$HOOKS_DIR" 2>/dev/null || true
+  restore_settings
+  rm -f "$STATE_FILE"
+  [[ -n "$SENTINEL_FILE" ]] && rm -f "$SENTINEL_FILE"
+  exit $exit_code
+}
+
+show_usage() {
+  awk '
+    NR >= 2 {
+      if ($0 !~ /^#/) {
+        exit
+      }
+      sub(/^# ?/, "")
+      print
+    }
+  ' "$0"
+}
+
+cooldown_remaining() {
+  local now elapsed
+  now=$(date +%s)
+  elapsed=$((now - LAST_RUN_TIMESTAMP))
+  if [[ $elapsed -lt $COOLDOWN_SECONDS ]]; then
+    echo $((COOLDOWN_SECONDS - elapsed))
+  else
+    echo 0
+  fi
+}
+
+wait_for_changes_fswatch() {
+  local fswatch_args=(-r -1)
+  # Escape dots in absolute path for fswatch regex
+  local escaped_claude_dir="${CLAUDE_DIR//./\\.}"
+  fswatch_args+=(--exclude "${escaped_claude_dir}/")
+  fswatch_args+=(--exclude '\.DS_Store')
+  for pattern in "${IGNORE_PATTERNS[@]+"${IGNORE_PATTERNS[@]}"}"; do
+    fswatch_args+=(--exclude "$pattern")
+  done
+  fswatch_args+=("${WATCH_DIRS[@]}")
+
+  log "waiting for changes (fswatch)..."
+  local changed
+  changed=$(fswatch "${fswatch_args[@]}" 2>/dev/null) || return 1
+  if [[ -n "$changed" ]]; then
+    CHANGED_FILES="$changed"
+    log "changed files: $(echo "$changed" | head -5 | tr '\n' ' ')"
+    return 0
+  fi
+  return 1
+}
+
+wait_for_changes_poll() {
+  if [[ -z "$SENTINEL_FILE" ]]; then
+    SENTINEL_FILE="$(mktemp "${TMPDIR:-/tmp}/claude-watch.XXXXXX")"
+  fi
+  touch "$SENTINEL_FILE"
+
+  log "waiting for changes (polling every 5s)..."
+  while true; do
+    sleep 5
+    local find_args=()
+    for dir in "${WATCH_DIRS[@]}"; do
+      find_args+=("$dir")
+    done
+    find_args+=(-newer "$SENTINEL_FILE" -not -path "${CLAUDE_DIR}/*" -not -name '.DS_Store')
+    for pattern in "${IGNORE_PATTERNS[@]+"${IGNORE_PATTERNS[@]}"}"; do
+      find_args+=(-not -name "$pattern")
+    done
+    find_args+=(-type f)
+
+    local changed
+    changed=$(find "${find_args[@]}" 2>/dev/null || true)
+    if [[ -n "$changed" ]]; then
+      touch "$SENTINEL_FILE"
+      CHANGED_FILES="$changed"
+      log "changed files: $(echo "$changed" | head -5 | tr '\n' ' ')"
+      return 0
+    fi
+  done
+}
+
+wait_for_changes() {
+  if [[ "$USE_FSWATCH" == "true" ]]; then
+    wait_for_changes_fswatch
+  else
+    wait_for_changes_poll
+  fi
+}
+
+expand_template() {
+  local files_list="$1"
+  local current_file="$2"
+  local files_space
+  files_space=$(echo "$files_list" | tr '\n' ' ' | sed 's/ $//')
+
+  local expanded=()
+  for arg in "${CLAUDE_ARGS[@]}"; do
+    arg="${arg//\{\{files\}\}/$files_space}"
+    arg="${arg//\{\{file\}\}/$current_file}"
+    expanded+=("$arg")
+  done
+  EXPANDED_ARGS=("${expanded[@]}")
+}
+
+run_claude_once() {
+  local -a args=("$@")
+
+  write_state "null" "false"
+
+  set +e
+  claude "${args[@]}"
+  local claude_exit_code=$?
+  set -e
+
+  local decision hook_called
+  decision=$(read_decision)
+  hook_called=$(read_hook_called)
+
+  log "claude exited (code=$claude_exit_code, decision=$decision, hook=$hook_called)"
+
+  # Return values via global variables
+  LAST_EXIT_CODE=$claude_exit_code
+  LAST_DECISION=$decision
+  LAST_HOOK_CALLED=$hook_called
+}
+
+# Evaluate the result of run_claude_once. Returns:
+#   0 = continue watching
+#   1 = stop watcher (sets WATCHER_EXIT_CODE)
+eval_run_result() {
+  if [[ "$LAST_HOOK_CALLED" != "true" ]]; then
+    case $LAST_EXIT_CODE in
+      129|130|137|143)
+        log "interrupted by signal"
+        WATCHER_EXIT_CODE=$LAST_EXIT_CODE
+        return 1
+        ;;
+    esac
+    log "hook not called; exiting with claude's status"
+    WATCHER_EXIT_CODE=$LAST_EXIT_CODE
+    return 1
+  fi
+
+  case "$LAST_DECISION" in
+    complete)
+      log "completion promise matched after trigger $TRIGGER_COUNT"
+      WATCHER_EXIT_CODE=0
+      return 1
+      ;;
+    done)
+      return 0
+      ;;
+    *)
+      log_error "unexpected decision: $LAST_DECISION"
+      WATCHER_EXIT_CODE=1
+      return 1
+      ;;
+  esac
+}
+
+main() {
+  for arg in "$@"; do
+    [[ "$arg" == "--help" || "$arg" == "-h" ]] && { show_usage; exit 0; }
+  done
+
+  check_dependencies
+  parse_args "$@"
+  validate_config
+
+  if [[ ${#CLAUDE_ARGS[@]} -eq 0 ]]; then
+    log_error "no arguments provided for claude. See --help for usage."
+    exit 1
+  fi
+
+  trap cleanup EXIT INT TERM
+
+  log "watch_dirs=${WATCH_DIRS[*]} cooldown=${COOLDOWN_SECONDS}s max_triggers=$MAX_TRIGGERS per_file=$PER_FILE completion_promise=${COMPLETION_PROMISE:-<none>}"
+
+  create_hook_script
+  merge_settings
+
+  WATCHER_EXIT_CODE=0
+
+  while true; do
+    wait_for_changes
+
+    local remaining
+    remaining=$(cooldown_remaining)
+    if [[ "$remaining" -gt 0 ]]; then
+      log "cooldown active, waiting ${remaining}s"
+      sleep "$remaining"
+    fi
+
+    TRIGGER_COUNT=$((TRIGGER_COUNT + 1))
+    LAST_RUN_TIMESTAMP=$(date +%s)
+
+    if [[ "$PER_FILE" == "true" ]]; then
+      local file_count=0
+      while IFS= read -r file; do
+        [[ -z "$file" ]] && continue
+        file_count=$((file_count + 1))
+        log "change detected, running claude for file $file_count: $file (trigger $TRIGGER_COUNT)"
+        expand_template "$CHANGED_FILES" "$file"
+        run_claude_once "${EXPANDED_ARGS[@]}"
+        if ! eval_run_result; then
+          return "$WATCHER_EXIT_CODE"
+        fi
+      done <<< "$CHANGED_FILES"
+    else
+      log "change detected, running claude (trigger $TRIGGER_COUNT)"
+      local first_file
+      first_file=$(echo "$CHANGED_FILES" | head -1)
+      expand_template "$CHANGED_FILES" "$first_file"
+      run_claude_once "${EXPANDED_ARGS[@]}"
+      if ! eval_run_result; then
+        return "$WATCHER_EXIT_CODE"
+      fi
+    fi
+
+    if [[ "$MAX_TRIGGERS" -gt 0 ]] && [[ "$TRIGGER_COUNT" -ge "$MAX_TRIGGERS" ]]; then
+      log "maximum triggers reached: $TRIGGER_COUNT"
+      return 0
+    fi
+
+    log "trigger $TRIGGER_COUNT complete, resuming watch"
+  done
+}
+
+main "$@"

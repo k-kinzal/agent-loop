@@ -1,0 +1,461 @@
+#!/usr/bin/env bash
+#
+# gemini-watch - Run Gemini CLI on file changes
+#
+# USAGE
+#     gemini-watch [OPTIONS] [--] [GEMINI_ARGS...]
+#
+# DESCRIPTION
+#     Watches directories for file creation and modification, then launches
+#     Gemini CLI in response. When Gemini finishes its work, the watcher
+#     returns to monitoring. A cooldown prevents over-triggering from rapid
+#     saves.
+#
+#     Uses Gemini's AfterAgent hook mechanism to ensure Gemini exits after
+#     each trigger, supporting both positional prompts and interactive
+#     sessions (-i).
+#
+# OPTIONS
+#     --watch-dir DIR
+#         Directory to watch recursively (repeatable, required)
+#
+#     --cooldown N
+#         Minimum seconds between Gemini runs. Default: 30
+#
+#     --per-file
+#         Run Gemini once per changed file instead of once per batch.
+#         Default: batch mode (one Gemini run for all changed files)
+#
+#     --completion-promise TEXT
+#         Stop the watcher when TEXT appears in Gemini's output
+#
+#     --max-triggers N
+#         Maximum number of triggers before exiting. Default: 0 (unlimited)
+#
+#     --ignore PATTERN
+#         Additional glob pattern to ignore (repeatable)
+#
+#     --debug
+#         Enable debug logging
+#
+#     --help, -h
+#         Show this help message
+#
+#     All other options are passed through to gemini.
+#
+# TEMPLATE VARIABLES
+#     {{files}}   Replaced with the list of changed file paths (space-separated)
+#     {{file}}    Replaced with a single file path (per-file mode)
+#
+# EXAMPLES
+#     gemini-watch --watch-dir ./src -- "describe what changed in {{files}}"
+#     gemini-watch --watch-dir ./src --per-file -- "review {{file}}"
+#     gemini-watch --watch-dir ./src --cooldown 10 -- -i "fix issues"
+#
+# DEPENDENCIES
+#     - gemini (Gemini CLI)
+#     - jq (JSON processor)
+#     - fswatch (recommended; falls back to find -newer polling)
+#
+
+set -euo pipefail
+
+readonly GEMINI_DIR="${PWD}/.gemini"
+readonly HOOKS_DIR="${GEMINI_DIR}/hooks"
+readonly STATE_FILE="${GEMINI_DIR}/gemini-watch.state.json"
+readonly SETTINGS_PROJECT="${GEMINI_DIR}/settings.json"
+readonly HOOK_SCRIPT_PATH="${HOOKS_DIR}/gemini-watch-hook.sh"
+readonly HOOK_LOG_FILE="${GEMINI_DIR}/gemini-watch-hook.log"
+
+WATCH_DIRS=()
+IGNORE_PATTERNS=()
+COOLDOWN_SECONDS=30
+MAX_TRIGGERS=0
+COMPLETION_PROMISE=""
+GEMINI_ARGS=()
+SETTINGS_MODIFIED=false
+TARGET_SETTINGS_BACKUP=""
+DEBUG=false
+TRIGGER_COUNT=0
+LAST_RUN_TIMESTAMP=0
+SENTINEL_FILE=""
+USE_FSWATCH=false
+PER_FILE=false
+CHANGED_FILES=""
+
+log() { [[ "$DEBUG" == "true" ]] && echo "[gemini-watch] $1" >&2 || true; }
+log_error() { echo "[gemini-watch] ERROR: $1" >&2; }
+
+check_dependencies() {
+  command -v jq >/dev/null 2>&1 || { log_error "jq is required but not installed."; exit 1; }
+  command -v gemini >/dev/null 2>&1 || { log_error "gemini CLI is required but not installed."; exit 1; }
+  if command -v fswatch &>/dev/null; then
+    USE_FSWATCH=true
+    log "using fswatch for file monitoring"
+  else
+    log "fswatch not found; falling back to find -newer polling"
+  fi
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --watch-dir)
+        [[ $# -ge 2 ]] || { log_error "--watch-dir requires a value."; exit 1; }
+        WATCH_DIRS+=("$2"); shift 2 ;;
+      --cooldown)
+        [[ $# -ge 2 ]] || { log_error "--cooldown requires a value."; exit 1; }
+        COOLDOWN_SECONDS="$2"; shift 2 ;;
+      --completion-promise)
+        [[ $# -ge 2 ]] || { log_error "--completion-promise requires a value."; exit 1; }
+        COMPLETION_PROMISE="$2"; shift 2 ;;
+      --max-triggers)
+        [[ $# -ge 2 ]] || { log_error "--max-triggers requires a value."; exit 1; }
+        MAX_TRIGGERS="$2"; shift 2 ;;
+      --per-file)
+        PER_FILE=true; shift ;;
+      --ignore)
+        [[ $# -ge 2 ]] || { log_error "--ignore requires a value."; exit 1; }
+        IGNORE_PATTERNS+=("$2"); shift 2 ;;
+      --debug)
+        DEBUG=true; shift ;;
+      --help|-h)
+        show_usage; exit 0 ;;
+      --)
+        shift; GEMINI_ARGS+=("$@"); break ;;
+      *)
+        GEMINI_ARGS+=("$1"); shift ;;
+    esac
+  done
+}
+
+validate_config() {
+  [[ ${#WATCH_DIRS[@]} -gt 0 ]] || { log_error "--watch-dir is required."; exit 1; }
+  [[ "$COOLDOWN_SECONDS" =~ ^[0-9]+$ ]] || { log_error "cooldown must be a non-negative integer."; exit 1; }
+  [[ "$MAX_TRIGGERS" =~ ^[0-9]+$ ]] || { log_error "max-triggers must be a non-negative integer."; exit 1; }
+  local normalized=()
+  for dir in "${WATCH_DIRS[@]}"; do
+    dir="${dir%/}"
+    [[ -d "$dir" ]] || { log_error "watch directory does not exist: $dir"; exit 1; }
+    normalized+=("$dir")
+  done
+  WATCH_DIRS=("${normalized[@]}")
+}
+
+write_state() {
+  local decision="${1:-null}"
+  local hook_called="${2:-false}"
+  mkdir -p "$GEMINI_DIR"
+  cat > "$STATE_FILE" << EOF
+{
+  "active": true,
+  "completion_promise": $(printf '%s' "$COMPLETION_PROMISE" | jq -Rs .),
+  "decision": $(if [ "$decision" = "null" ]; then echo "null"; else echo "\"$decision\""; fi),
+  "hook_called": $hook_called
+}
+EOF
+}
+
+read_decision() {
+  [[ -f "$STATE_FILE" ]] && jq -r '.decision // "null"' "$STATE_FILE" || echo "null"
+}
+
+read_hook_called() {
+  [[ -f "$STATE_FILE" ]] && jq -r '.hook_called // false' "$STATE_FILE" || echo "false"
+}
+
+create_hook_script() {
+  mkdir -p "$HOOKS_DIR"
+  cat > "$HOOK_SCRIPT_PATH" << 'HOOKEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_FILE="${GEMINI_PROJECT_DIR}/.gemini/gemini-watch.state.json"
+DEBUG_FLAG_FILE="${GEMINI_PROJECT_DIR}/.gemini/gemini-watch.debug"
+HOOK_LOG_FILE="${GEMINI_PROJECT_DIR}/.gemini/gemini-watch-hook.log"
+
+debug_log() {
+  [[ -f "$DEBUG_FLAG_FILE" ]] || return 0
+  mkdir -p "$(dirname "$HOOK_LOG_FILE")"
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$HOOK_LOG_FILE"
+}
+
+INPUT=$(cat)
+
+[[ ! -f "$STATE_FILE" ]] && exit 0
+
+STATE=$(cat "$STATE_FILE")
+[[ $(echo "$STATE" | jq -r '.active // false') != "true" ]] && exit 0
+
+COMPLETION_PROMISE=$(echo "$STATE" | jq -r '.completion_promise // ""')
+PROMPT_RESPONSE=$(echo "$INPUT" | jq -r '.prompt_response // empty')
+
+debug_log "AfterAgent hook started: completion_promise=${COMPLETION_PROMISE:-<none>}"
+
+DECISION="done"
+if [[ -n "$COMPLETION_PROMISE" ]] && [[ -n "$PROMPT_RESPONSE" ]] && grep -qF -- "$COMPLETION_PROMISE" <<< "$PROMPT_RESPONSE"; then
+  DECISION="complete"
+  debug_log "decision=complete (completion promise matched)"
+else
+  debug_log "decision=done"
+fi
+
+jq --arg d "$DECISION" '.decision = $d | .hook_called = true' \
+  "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+
+printf '%s\n' '{"continue": false}'
+exit 0
+HOOKEOF
+
+  chmod +x "$HOOK_SCRIPT_PATH"
+  if [[ "$DEBUG" == "true" ]]; then
+    touch "${GEMINI_DIR}/gemini-watch.debug"
+  fi
+}
+
+merge_settings() {
+  mkdir -p "$GEMINI_DIR"
+  TARGET_SETTINGS_BACKUP="${SETTINGS_PROJECT}.gemini-watch-backup"
+
+  local hook_entry='{"matcher":"*","hooks":[{"name":"gemini-watch","type":"command","command":"\"$GEMINI_PROJECT_DIR\"/.gemini/hooks/gemini-watch-hook.sh"}]}'
+
+  if [[ -f "$SETTINGS_PROJECT" ]]; then
+    cp "$SETTINGS_PROJECT" "$TARGET_SETTINGS_BACKUP"
+    jq --argjson hook "$hook_entry" '
+      if .hooks.AfterAgent then
+        .hooks.AfterAgent += [$hook]
+      elif .hooks then
+        .hooks.AfterAgent = [$hook]
+      else
+        . + {"hooks":{"AfterAgent":[$hook]}}
+      end
+    ' "$SETTINGS_PROJECT" > "${SETTINGS_PROJECT}.tmp" && mv "${SETTINGS_PROJECT}.tmp" "$SETTINGS_PROJECT"
+  else
+    cat > "$SETTINGS_PROJECT" << 'EOF'
+{"hooks":{"AfterAgent":[{"matcher":"*","hooks":[{"name":"gemini-watch","type":"command","command":"\"$GEMINI_PROJECT_DIR\"/.gemini/hooks/gemini-watch-hook.sh"}]}]}}
+EOF
+  fi
+
+  SETTINGS_MODIFIED=true
+  log "AfterAgent hook registered in settings.json"
+}
+
+restore_settings() {
+  if [[ "$SETTINGS_MODIFIED" == "true" ]]; then
+    if [[ -f "$TARGET_SETTINGS_BACKUP" ]]; then
+      mv "$TARGET_SETTINGS_BACKUP" "$SETTINGS_PROJECT"
+    else
+      rm -f "$SETTINGS_PROJECT"
+    fi
+    SETTINGS_MODIFIED=false
+  fi
+}
+
+cleanup() {
+  local exit_code=$?
+  rm -f "$HOOK_SCRIPT_PATH"
+  rm -f "${GEMINI_DIR}/gemini-watch.debug"
+  rm -f "$HOOK_LOG_FILE"
+  rmdir "$HOOKS_DIR" 2>/dev/null || true
+  restore_settings
+  rm -f "$STATE_FILE"
+  [[ -n "$SENTINEL_FILE" ]] && rm -f "$SENTINEL_FILE"
+  exit "$exit_code"
+}
+
+show_usage() {
+  awk '
+    NR >= 2 {
+      if ($0 !~ /^#/) { exit }
+      sub(/^# ?/, "")
+      print
+    }
+  ' "$0"
+}
+
+cooldown_remaining() {
+  local now elapsed
+  now=$(date +%s)
+  elapsed=$((now - LAST_RUN_TIMESTAMP))
+  if [[ $elapsed -lt $COOLDOWN_SECONDS ]]; then
+    echo $((COOLDOWN_SECONDS - elapsed))
+  else
+    echo 0
+  fi
+}
+
+wait_for_changes_fswatch() {
+  local escaped_gemini_dir="${GEMINI_DIR//./\\.}"
+  local fswatch_args=(-r -1 --exclude "${escaped_gemini_dir}/" --exclude '\.DS_Store')
+  for pattern in "${IGNORE_PATTERNS[@]+"${IGNORE_PATTERNS[@]}"}"; do
+    fswatch_args+=(--exclude "$pattern")
+  done
+  fswatch_args+=("${WATCH_DIRS[@]}")
+  log "waiting for changes (fswatch)..."
+  local changed
+  changed=$(fswatch "${fswatch_args[@]}" 2>/dev/null) || return 1
+  if [[ -n "$changed" ]]; then
+    CHANGED_FILES="$changed"
+    log "changed files: $(echo "$changed" | head -5 | tr '\n' ' ')"
+    return 0
+  fi
+  return 1
+}
+
+wait_for_changes_poll() {
+  if [[ -z "$SENTINEL_FILE" ]]; then
+    SENTINEL_FILE="$(mktemp "${TMPDIR:-/tmp}/gemini-watch.XXXXXX")"
+  fi
+  touch "$SENTINEL_FILE"
+  log "waiting for changes (polling every 5s)..."
+  while true; do
+    sleep 5
+    local find_args=()
+    for dir in "${WATCH_DIRS[@]}"; do find_args+=("$dir"); done
+    find_args+=(-newer "$SENTINEL_FILE" -not -path "${GEMINI_DIR}/*" -not -name '.DS_Store')
+    for pattern in "${IGNORE_PATTERNS[@]+"${IGNORE_PATTERNS[@]}"}"; do
+      find_args+=(-not -name "$pattern")
+    done
+    find_args+=(-type f)
+    local changed
+    changed=$(find "${find_args[@]}" 2>/dev/null || true)
+    if [[ -n "$changed" ]]; then
+      touch "$SENTINEL_FILE"
+      CHANGED_FILES="$changed"
+      log "changed files: $(echo "$changed" | head -5 | tr '\n' ' ')"
+      return 0
+    fi
+  done
+}
+
+wait_for_changes() {
+  if [[ "$USE_FSWATCH" == "true" ]]; then
+    wait_for_changes_fswatch
+  else
+    wait_for_changes_poll
+  fi
+}
+
+expand_template() {
+  local files_list="$1"
+  local current_file="$2"
+  local files_space
+  files_space=$(echo "$files_list" | tr '\n' ' ' | sed 's/ $//')
+  EXPANDED_ARGS=()
+  for arg in "${GEMINI_ARGS[@]}"; do
+    arg="${arg//\{\{files\}\}/$files_space}"
+    arg="${arg//\{\{file\}\}/$current_file}"
+    EXPANDED_ARGS+=("$arg")
+  done
+}
+
+run_gemini_once() {
+  local -a args=("$@")
+
+  write_state "null" "false"
+
+  set +e
+  gemini "${args[@]}"
+  local gemini_exit_code=$?
+  set -e
+
+  local decision hook_called
+  decision=$(read_decision)
+  hook_called=$(read_hook_called)
+
+  log "gemini exited (code=$gemini_exit_code, decision=$decision, hook=$hook_called)"
+
+  LAST_EXIT_CODE=$gemini_exit_code
+  LAST_DECISION=$decision
+  LAST_HOOK_CALLED=$hook_called
+}
+
+eval_run_result() {
+  if [[ "$LAST_HOOK_CALLED" != "true" ]]; then
+    log "hook not called; exiting with gemini's status"
+    WATCHER_EXIT_CODE=$LAST_EXIT_CODE
+    return 1
+  fi
+
+  case "$LAST_DECISION" in
+    complete)
+      log "completion promise matched after trigger $TRIGGER_COUNT"
+      WATCHER_EXIT_CODE=0
+      return 1
+      ;;
+    done)
+      return 0
+      ;;
+    *)
+      log_error "unexpected decision: $LAST_DECISION"
+      WATCHER_EXIT_CODE=1
+      return 1
+      ;;
+  esac
+}
+
+main() {
+  for arg in "$@"; do
+    [[ "$arg" == "--help" || "$arg" == "-h" ]] && { show_usage; exit 0; }
+  done
+
+  check_dependencies
+  parse_args "$@"
+  validate_config
+
+  if [[ ${#GEMINI_ARGS[@]} -eq 0 ]]; then
+    log_error "no arguments provided for gemini. See --help for usage."
+    exit 1
+  fi
+
+  trap cleanup EXIT INT TERM
+
+  log "watch_dirs=${WATCH_DIRS[*]} cooldown=${COOLDOWN_SECONDS}s max_triggers=$MAX_TRIGGERS per_file=$PER_FILE completion_promise=${COMPLETION_PROMISE:-<none>}"
+
+  create_hook_script
+  merge_settings
+
+  WATCHER_EXIT_CODE=0
+
+  while true; do
+    wait_for_changes
+
+    local remaining
+    remaining=$(cooldown_remaining)
+    if [[ "$remaining" -gt 0 ]]; then
+      log "cooldown active, waiting ${remaining}s"
+      sleep "$remaining"
+    fi
+
+    TRIGGER_COUNT=$((TRIGGER_COUNT + 1))
+    LAST_RUN_TIMESTAMP=$(date +%s)
+
+    if [[ "$PER_FILE" == "true" ]]; then
+      local file_count=0
+      while IFS= read -r file; do
+        [[ -z "$file" ]] && continue
+        file_count=$((file_count + 1))
+        log "change detected, running gemini for file $file_count: $file (trigger $TRIGGER_COUNT)"
+        expand_template "$CHANGED_FILES" "$file"
+        run_gemini_once "${EXPANDED_ARGS[@]}"
+        if ! eval_run_result; then return "$WATCHER_EXIT_CODE"; fi
+      done <<< "$CHANGED_FILES"
+    else
+      log "change detected, running gemini (trigger $TRIGGER_COUNT)"
+      local first_file
+      first_file=$(echo "$CHANGED_FILES" | head -1)
+      expand_template "$CHANGED_FILES" "$first_file"
+      run_gemini_once "${EXPANDED_ARGS[@]}"
+      if ! eval_run_result; then return "$WATCHER_EXIT_CODE"; fi
+    fi
+
+    if [[ "$MAX_TRIGGERS" -gt 0 ]] && [[ "$TRIGGER_COUNT" -ge "$MAX_TRIGGERS" ]]; then
+      log "maximum triggers reached: $TRIGGER_COUNT"
+      return 0
+    fi
+
+    log "trigger $TRIGGER_COUNT complete, resuming watch"
+  done
+}
+
+main "$@"

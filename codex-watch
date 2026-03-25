@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+#
+# codex-watch - Run Codex CLI on file changes
+#
+# USAGE
+#     codex-watch [OPTIONS] [--] [CODEX_ARGS...]
+#
+# DESCRIPTION
+#     Watches directories for file creation and modification, then launches
+#     Codex CLI in response. When Codex finishes its work, the watcher returns
+#     to monitoring. A cooldown prevents over-triggering from rapid saves.
+#
+#     Codex must be run in a mode that exits on completion (e.g. `codex exec`)
+#     for autonomous watching to work. Interactive Codex sessions still launch
+#     but the watcher cannot continue until the session exits.
+#
+# OPTIONS
+#     --watch-dir DIR
+#         Directory to watch recursively (repeatable, required)
+#
+#     --cooldown N
+#         Minimum seconds between Codex runs. Default: 30
+#
+#     --per-file
+#         Run Codex once per changed file instead of once per batch.
+#         Default: batch mode (one Codex run for all changed files)
+#
+#     --completion-promise TEXT
+#         Stop the watcher when TEXT appears in Codex output
+#         Note: promise matching is best-effort for full-screen TUI sessions
+#
+#     --max-triggers N
+#         Maximum number of triggers before exiting. Default: 0 (unlimited)
+#
+#     --ignore PATTERN
+#         Additional glob pattern to ignore (repeatable)
+#
+#     --debug
+#     --loop-debug
+#         Enable debug logging
+#
+#     --help, -h
+#         Show this help message
+#
+#     All other options are passed through to codex.
+#
+# TEMPLATE VARIABLES
+#     {{files}}   Replaced with the list of changed file paths (space-separated)
+#     {{file}}    Replaced with a single file path (per-file mode)
+#
+# EXAMPLES
+#     codex-watch --watch-dir ./src -- exec "describe what changed in {{files}}"
+#     codex-watch --watch-dir ./src --per-file -- exec "review {{file}}"
+#     codex-watch --watch-dir ./src --cooldown 10 -- exec "fix issues"
+#
+# DEPENDENCIES
+#     - codex
+#     - script (only needed for interactive completion-promise capture)
+#     - fswatch (recommended; falls back to find -newer polling)
+#
+
+set -euo pipefail
+
+readonly WRAPPER_NAME="codex-watch"
+readonly AGENT_NAME="Codex CLI"
+: "${CODEX_WATCH_BIN:=codex}"
+readonly AGENT_BIN="$CODEX_WATCH_BIN"
+
+WATCH_DIRS=()
+IGNORE_PATTERNS=()
+COOLDOWN_SECONDS=30
+MAX_TRIGGERS=0
+COMPLETION_PROMISE=""
+AGENT_ARGS=()
+DEBUG=false
+TRIGGER_COUNT=0
+LAST_RUN_TIMESTAMP=0
+SENTINEL_FILE=""
+USE_FSWATCH=false
+PER_FILE=false
+CHANGED_FILES=""
+TRANSCRIPT_FILE=""
+
+log() {
+  [[ "$DEBUG" == "true" ]] && printf '[%s] %s\n' "$WRAPPER_NAME" "$1" >&2 || true
+}
+
+log_error() {
+  printf '[%s] ERROR: %s\n' "$WRAPPER_NAME" "$1" >&2
+}
+
+show_usage() {
+  awk '
+    NR >= 2 {
+      if ($0 !~ /^#/) { exit }
+      sub(/^# ?/, "")
+      print
+    }
+  ' "$0"
+}
+
+check_dependencies() {
+  command -v "$AGENT_BIN" >/dev/null 2>&1 || {
+    log_error "$AGENT_NAME executable not found: $AGENT_BIN"
+    exit 1
+  }
+  if command -v fswatch &>/dev/null; then
+    USE_FSWATCH=true
+    log "using fswatch for file monitoring"
+  else
+    log "fswatch not found; falling back to find -newer polling"
+  fi
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --watch-dir)
+        [[ $# -ge 2 ]] || { log_error "--watch-dir requires a value."; exit 1; }
+        WATCH_DIRS+=("$2"); shift 2 ;;
+      --cooldown)
+        [[ $# -ge 2 ]] || { log_error "--cooldown requires a value."; exit 1; }
+        COOLDOWN_SECONDS="$2"; shift 2 ;;
+      --completion-promise|--loop-completion-promise)
+        [[ $# -ge 2 ]] || { log_error "$1 requires a value."; exit 1; }
+        COMPLETION_PROMISE="$2"; shift 2 ;;
+      --max-triggers)
+        [[ $# -ge 2 ]] || { log_error "--max-triggers requires a value."; exit 1; }
+        MAX_TRIGGERS="$2"; shift 2 ;;
+      --per-file)
+        PER_FILE=true; shift ;;
+      --ignore)
+        [[ $# -ge 2 ]] || { log_error "--ignore requires a value."; exit 1; }
+        IGNORE_PATTERNS+=("$2"); shift 2 ;;
+      --debug|--loop-debug)
+        DEBUG=true; shift ;;
+      --help|-h)
+        show_usage; exit 0 ;;
+      --)
+        shift; AGENT_ARGS+=("$@"); break ;;
+      *)
+        AGENT_ARGS+=("$1"); shift ;;
+    esac
+  done
+}
+
+validate_config() {
+  [[ ${#WATCH_DIRS[@]} -gt 0 ]] || { log_error "--watch-dir is required."; exit 1; }
+  [[ "$COOLDOWN_SECONDS" =~ ^[0-9]+$ ]] || { log_error "cooldown must be a non-negative integer."; exit 1; }
+  [[ "$MAX_TRIGGERS" =~ ^[0-9]+$ ]] || { log_error "max-triggers must be a non-negative integer."; exit 1; }
+  local normalized=()
+  for dir in "${WATCH_DIRS[@]}"; do
+    dir="${dir%/}"
+    [[ -d "$dir" ]] || { log_error "watch directory does not exist: $dir"; exit 1; }
+    normalized+=("$dir")
+  done
+  WATCH_DIRS=("${normalized[@]}")
+}
+
+setup_transcript_file() {
+  [[ -n "$COMPLETION_PROMISE" ]] || return 0
+  TRANSCRIPT_FILE="$(mktemp "${TMPDIR:-/tmp}/${WRAPPER_NAME}.XXXXXX")"
+}
+
+cleanup() {
+  local exit_code=$?
+  [[ -n "$TRANSCRIPT_FILE" ]] && rm -f "$TRANSCRIPT_FILE"
+  [[ -n "$SENTINEL_FILE" ]] && rm -f "$SENTINEL_FILE"
+  exit "$exit_code"
+}
+
+transcript_contains_promise() {
+  [[ -n "$COMPLETION_PROMISE" ]] || return 1
+  [[ -n "$TRANSCRIPT_FILE" && -f "$TRANSCRIPT_FILE" ]] || return 1
+  if LC_ALL=C grep -aFq -- "$COMPLETION_PROMISE" "$TRANSCRIPT_FILE"; then
+    return 0
+  fi
+  if command -v strings >/dev/null 2>&1; then
+    if LC_ALL=C strings -a -n 1 "$TRANSCRIPT_FILE" | grep -Fq -- "$COMPLETION_PROMISE"; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+cooldown_remaining() {
+  local now elapsed
+  now=$(date +%s)
+  elapsed=$((now - LAST_RUN_TIMESTAMP))
+  if [[ $elapsed -lt $COOLDOWN_SECONDS ]]; then
+    echo $((COOLDOWN_SECONDS - elapsed))
+  else
+    echo 0
+  fi
+}
+
+wait_for_changes_fswatch() {
+  local fswatch_args=(-r -1 --exclude '\.DS_Store')
+  for pattern in "${IGNORE_PATTERNS[@]+"${IGNORE_PATTERNS[@]}"}"; do
+    fswatch_args+=(--exclude "$pattern")
+  done
+  fswatch_args+=("${WATCH_DIRS[@]}")
+  log "waiting for changes (fswatch)..."
+  local changed
+  changed=$(fswatch "${fswatch_args[@]}" 2>/dev/null) || return 1
+  if [[ -n "$changed" ]]; then
+    CHANGED_FILES="$changed"
+    log "changed files: $(echo "$changed" | head -5 | tr '\n' ' ')"
+    return 0
+  fi
+  return 1
+}
+
+wait_for_changes_poll() {
+  if [[ -z "$SENTINEL_FILE" ]]; then
+    SENTINEL_FILE="$(mktemp "${TMPDIR:-/tmp}/${WRAPPER_NAME}.XXXXXX")"
+  fi
+  touch "$SENTINEL_FILE"
+  log "waiting for changes (polling every 5s)..."
+  while true; do
+    sleep 5
+    local find_args=()
+    for dir in "${WATCH_DIRS[@]}"; do find_args+=("$dir"); done
+    find_args+=(-newer "$SENTINEL_FILE" -not -name '.DS_Store')
+    for pattern in "${IGNORE_PATTERNS[@]+"${IGNORE_PATTERNS[@]}"}"; do
+      find_args+=(-not -name "$pattern")
+    done
+    find_args+=(-type f)
+    local changed
+    changed=$(find "${find_args[@]}" 2>/dev/null || true)
+    if [[ -n "$changed" ]]; then
+      touch "$SENTINEL_FILE"
+      CHANGED_FILES="$changed"
+      log "changed files: $(echo "$changed" | head -5 | tr '\n' ' ')"
+      return 0
+    fi
+  done
+}
+
+wait_for_changes() {
+  if [[ "$USE_FSWATCH" == "true" ]]; then
+    wait_for_changes_fswatch
+  else
+    wait_for_changes_poll
+  fi
+}
+
+expand_template() {
+  local files_list="$1"
+  local current_file="$2"
+  local files_space
+  files_space=$(echo "$files_list" | tr '\n' ' ' | sed 's/ $//')
+  EXPANDED_ARGS=()
+  for arg in "${AGENT_ARGS[@]}"; do
+    arg="${arg//\{\{files\}\}/$files_space}"
+    arg="${arg//\{\{file\}\}/$current_file}"
+    EXPANDED_ARGS+=("$arg")
+  done
+}
+
+run_agent_once() {
+  local -a args=("$@")
+
+  if [[ -n "$TRANSCRIPT_FILE" ]]; then
+    : > "$TRANSCRIPT_FILE"
+  fi
+
+  set +e
+  if [[ -n "$COMPLETION_PROMISE" ]]; then
+    if [[ -t 0 && -t 1 ]]; then
+      script -q "$TRANSCRIPT_FILE" "$AGENT_BIN" "${args[@]}"
+      LAST_EXIT_CODE=$?
+    else
+      "$AGENT_BIN" "${args[@]}" 2>&1 | tee "$TRANSCRIPT_FILE"
+      LAST_EXIT_CODE=${PIPESTATUS[0]}
+    fi
+  else
+    "$AGENT_BIN" "${args[@]}"
+    LAST_EXIT_CODE=$?
+  fi
+  set -e
+
+  log "$AGENT_BIN exited with code $LAST_EXIT_CODE"
+}
+
+# Returns: 0 = continue watching, 1 = stop watcher (sets WATCHER_EXIT_CODE)
+eval_run_result() {
+  case "$LAST_EXIT_CODE" in
+    0) ;;
+    129|130|137|143)
+      log "interrupted by signal"
+      WATCHER_EXIT_CODE=$LAST_EXIT_CODE
+      return 1
+      ;;
+    *)
+      log "non-zero exit code: $LAST_EXIT_CODE, continuing to watch"
+      ;;
+  esac
+  if transcript_contains_promise; then
+    log "completion promise matched after trigger $TRIGGER_COUNT"
+    WATCHER_EXIT_CODE=0
+    return 1
+  fi
+  return 0
+}
+
+main() {
+  parse_args "$@"
+  validate_config
+  check_dependencies
+  setup_transcript_file
+  trap cleanup EXIT INT TERM
+
+  log "watch_dirs=${WATCH_DIRS[*]} cooldown=${COOLDOWN_SECONDS}s max_triggers=$MAX_TRIGGERS per_file=$PER_FILE completion_promise=${COMPLETION_PROMISE:-<none>}"
+
+  WATCHER_EXIT_CODE=0
+
+  while true; do
+    wait_for_changes
+
+    local remaining
+    remaining=$(cooldown_remaining)
+    if [[ "$remaining" -gt 0 ]]; then
+      log "cooldown active, waiting ${remaining}s"
+      sleep "$remaining"
+    fi
+
+    TRIGGER_COUNT=$((TRIGGER_COUNT + 1))
+    LAST_RUN_TIMESTAMP=$(date +%s)
+
+    if [[ "$PER_FILE" == "true" ]]; then
+      local file_count=0
+      while IFS= read -r file; do
+        [[ -z "$file" ]] && continue
+        file_count=$((file_count + 1))
+        log "change detected, running $AGENT_BIN for file $file_count: $file (trigger $TRIGGER_COUNT)"
+        expand_template "$CHANGED_FILES" "$file"
+        run_agent_once "${EXPANDED_ARGS[@]}"
+        if ! eval_run_result; then
+          return "$WATCHER_EXIT_CODE"
+        fi
+      done <<< "$CHANGED_FILES"
+    else
+      log "change detected, running $AGENT_BIN (trigger $TRIGGER_COUNT)"
+      local first_file
+      first_file=$(echo "$CHANGED_FILES" | head -1)
+      expand_template "$CHANGED_FILES" "$first_file"
+      run_agent_once "${EXPANDED_ARGS[@]}"
+      if ! eval_run_result; then
+        return "$WATCHER_EXIT_CODE"
+      fi
+    fi
+
+    if [[ "$MAX_TRIGGERS" -gt 0 ]] && [[ "$TRIGGER_COUNT" -ge "$MAX_TRIGGERS" ]]; then
+      log "maximum triggers reached: $TRIGGER_COUNT"
+      return 0
+    fi
+
+    log "trigger $TRIGGER_COUNT complete, resuming watch"
+  done
+}
+
+main "$@"

@@ -21,6 +21,13 @@ wrapper, not the agent, responsible for loop control.
 - `cursor-loop`: Cursor Agent CLI wrapper for iterative process restarts
 - `opencode-loop`: OpenCode CLI wrapper for iterative process restarts
 - `cline-loop`: Cline CLI wrapper for iterative process restarts
+- `claude-watch`: Claude Code wrapper triggered by file changes
+- `codex-watch`: Codex CLI wrapper triggered by file changes
+- `gemini-watch`: Gemini CLI wrapper triggered by file changes
+- `copilot-watch`: GitHub Copilot CLI wrapper triggered by file changes
+- `cursor-watch`: Cursor Agent CLI wrapper triggered by file changes
+- `opencode-watch`: OpenCode CLI wrapper triggered by file changes
+- `cline-watch`: Cline CLI wrapper triggered by file changes
 
 ## Installation
 
@@ -37,7 +44,7 @@ You can also clone the repository and install whichever scripts you need.
 ```bash
 git clone <repo-url>
 cd agent-loop
-chmod +x claude-loop codex-loop gemini-loop copilot-loop cursor-loop opencode-loop cline-loop
+chmod +x claude-loop claude-watch codex-loop codex-watch gemini-loop gemini-watch copilot-loop copilot-watch cursor-loop cursor-watch opencode-loop opencode-watch cline-loop cline-watch
 ```
 
 ## Loop behavior
@@ -78,6 +85,16 @@ codex-loop -- --help
 - Depends on `claude` and `jq`
 - Uses Claude's Stop hook mechanism, so it can keep Claude working without
   relying on process exit alone
+
+### `claude-watch`
+
+- Depends on `claude`, `jq`, and optionally `fswatch`
+- Watches directories for file creation and modification, then runs Claude Code
+- Uses Claude's Stop hook mechanism with SIGTERM to ensure Claude exits after
+  each trigger, supporting both `-p` and interactive modes
+- Falls back to `find -newer` polling when `fswatch` is not installed
+- Cooldown prevents over-triggering from rapid saves (default: 30 seconds)
+- Ignores `.git/`, `.claude/`, and `.DS_Store` by default
 
 ### `codex-loop`
 
@@ -128,6 +145,40 @@ codex-loop -- --help
   headless flags such as `--yolo` or `--no-interactive`
 - Interactive Cline still launches, but the wrapper cannot start the next
   iteration until that session exits
+
+### `codex-watch`
+
+- Depends on `codex` and optionally `fswatch`
+- Watches directories for file changes, then runs Codex CLI
+- Reliable autonomous watching requires `codex exec ...`
+- Supports `--per-file` mode and `{{file}}`/`{{files}}` template variables
+
+### `gemini-watch`
+
+- Depends on `gemini`, `jq`, and optionally `fswatch`
+- Uses a temporary Gemini `AfterAgent` hook to end each session after a trigger
+- Supports both positional prompts and interactive `-i` sessions
+
+### `copilot-watch`
+
+- Depends on `copilot`, `jq`, and optionally `fswatch`
+- Uses a project-local Copilot `agentStop` hook under `.github/hooks/`
+- Terminates Copilot after each trigger via SIGTERM
+
+### `cursor-watch`
+
+- Depends on `cursor-agent` and optionally `fswatch`
+- Reliable autonomous watching is best with `cursor-agent --print ...`
+
+### `opencode-watch`
+
+- Depends on `opencode` and optionally `fswatch`
+- Reliable autonomous watching is best with `opencode run ...`
+
+### `cline-watch`
+
+- Depends on `cline` and optionally `fswatch`
+- Reliable autonomous watching is best with `cline --oneshot ...`
 
 ## Development
 
