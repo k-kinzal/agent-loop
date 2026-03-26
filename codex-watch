@@ -80,6 +80,8 @@ USE_FSWATCH=false
 PER_FILE=false
 CHANGED_FILES=""
 TRANSCRIPT_FILE=""
+PRE_RUN_SENTINEL=""
+SKIP_WAIT=false
 
 log() {
   [[ "$DEBUG" == "true" ]] && printf '[%s] %s\n' "$WRAPPER_NAME" "$1" >&2 || true
@@ -166,6 +168,7 @@ cleanup() {
   local exit_code=$?
   [[ -n "$TRANSCRIPT_FILE" ]] && rm -f "$TRANSCRIPT_FILE"
   [[ -n "$SENTINEL_FILE" ]] && rm -f "$SENTINEL_FILE"
+  [[ -n "$PRE_RUN_SENTINEL" ]] && rm -f "$PRE_RUN_SENTINEL"
   exit "$exit_code"
 }
 
@@ -245,6 +248,25 @@ wait_for_changes() {
   fi
 }
 
+check_changes_during_run() {
+  [[ -z "$PRE_RUN_SENTINEL" ]] && return 1
+  local find_args=()
+  for dir in "${WATCH_DIRS[@]}"; do find_args+=("$dir"); done
+  find_args+=(-newer "$PRE_RUN_SENTINEL" -not -name '.DS_Store')
+  for pattern in "${IGNORE_PATTERNS[@]+"${IGNORE_PATTERNS[@]}"}"; do
+    find_args+=(-not -name "$pattern")
+  done
+  find_args+=(-type f)
+  local changed
+  changed=$(find "${find_args[@]}" 2>/dev/null || true)
+  if [[ -n "$changed" ]]; then
+    CHANGED_FILES="$changed"
+    log "changes detected during agent run: $(echo "$changed" | head -5 | tr '\n' ' ')"
+    return 0
+  fi
+  return 1
+}
+
 expand_template() {
   local files_list="$1"
   local current_file="$2"
@@ -316,7 +338,12 @@ main() {
   WATCHER_EXIT_CODE=0
 
   while true; do
-    wait_for_changes
+    if [[ "$SKIP_WAIT" == "true" ]]; then
+      SKIP_WAIT=false
+      log "re-triggering immediately for changes during previous run"
+    else
+      wait_for_changes
+    fi
 
     local remaining
     remaining=$(cooldown_remaining)
@@ -327,6 +354,12 @@ main() {
 
     TRIGGER_COUNT=$((TRIGGER_COUNT + 1))
     LAST_RUN_TIMESTAMP=$(date +%s)
+
+    # Record pre-run timestamp to detect changes during agent execution
+    if [[ -z "$PRE_RUN_SENTINEL" ]]; then
+      PRE_RUN_SENTINEL="$(mktemp "${TMPDIR:-/tmp}/${WRAPPER_NAME}-prerun.XXXXXX")"
+    fi
+    touch "$PRE_RUN_SENTINEL"
 
     if [[ "$PER_FILE" == "true" ]]; then
       local file_count=0
@@ -354,6 +387,11 @@ main() {
     if [[ "$MAX_TRIGGERS" -gt 0 ]] && [[ "$TRIGGER_COUNT" -ge "$MAX_TRIGGERS" ]]; then
       log "maximum triggers reached: $TRIGGER_COUNT"
       return 0
+    fi
+
+    # Check for file changes that occurred during agent execution
+    if check_changes_during_run; then
+      SKIP_WAIT=true
     fi
 
     log "trigger $TRIGGER_COUNT complete, resuming watch"
