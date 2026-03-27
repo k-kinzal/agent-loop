@@ -452,6 +452,7 @@ expand_template() {
 
 run_claude_once() {
   local -a args=("$@")
+  log "claude args (${#args[@]}): $(printf "'%s' " "${args[@]}")"
 
   write_state "null" "false"
 
@@ -555,7 +556,7 @@ main() {
 
     if [[ "$PER_FILE" == "true" ]]; then
       local file_count=0
-      while IFS= read -r file; do
+      while IFS= read -r file <&3; do
         [[ -z "$file" ]] && continue
         file_count=$((file_count + 1))
         log "change detected, running claude for file $file_count: $file (trigger $TRIGGER_COUNT)"
@@ -564,7 +565,7 @@ main() {
         if ! eval_run_result; then
           return "$WATCHER_EXIT_CODE"
         fi
-      done <<< "$CHANGED_FILES"
+      done 3<<< "$CHANGED_FILES"
     else
       log "change detected, running claude (trigger $TRIGGER_COUNT)"
       local first_file
