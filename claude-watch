@@ -559,7 +559,7 @@ main() {
         [[ -z "$file" ]] && continue
         file_count=$((file_count + 1))
         log "change detected, running claude for file $file_count: $file (trigger $TRIGGER_COUNT)"
-        expand_template "$CHANGED_FILES" "$file"
+        expand_template "$file" "$file"
         run_claude_once "${EXPANDED_ARGS[@]}"
         if ! eval_run_result; then
           return "$WATCHER_EXIT_CODE"

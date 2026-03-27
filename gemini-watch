@@ -469,7 +469,7 @@ main() {
         [[ -z "$file" ]] && continue
         file_count=$((file_count + 1))
         log "change detected, running gemini for file $file_count: $file (trigger $TRIGGER_COUNT)"
-        expand_template "$CHANGED_FILES" "$file"
+        expand_template "$file" "$file"
         run_gemini_once "${EXPANDED_ARGS[@]}"
         if ! eval_run_result; then return "$WATCHER_EXIT_CODE"; fi
       done <<< "$CHANGED_FILES"
