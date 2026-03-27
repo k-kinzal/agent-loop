@@ -584,6 +584,7 @@ main() {
     # Check for file changes that occurred during Claude's execution
     if check_changes_during_run; then
       SKIP_WAIT=true
+      LAST_RUN_TIMESTAMP=$(date +%s)
     fi
 
     log "trigger $TRIGGER_COUNT complete, resuming watch"
