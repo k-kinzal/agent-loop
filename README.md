@@ -90,6 +90,10 @@ codex-loop -- --help
 
 - Depends on `claude`, `jq`, and optionally `fswatch`
 - Watches directories for file creation and modification, then runs Claude Code
+- Supports `--include`/`--exclude` glob filters and can derive watch roots from
+  `--include` when `--watch-dir` is omitted
+- For home-relative patterns, prefer quoted `~` like `'~/.claude/projects/*/*.jsonl'`
+  or double-quoted `$HOME/...`; do not single-quote `$HOME/...`
 - Uses Claude's Stop hook mechanism with SIGTERM to ensure Claude exits after
   each trigger, supporting both `-p` and interactive modes
 - Falls back to `find -newer` polling when `fswatch` is not installed
@@ -150,34 +154,46 @@ codex-loop -- --help
 
 - Depends on `codex` and optionally `fswatch`
 - Watches directories for file changes, then runs Codex CLI
+- Supports `--include`/`--exclude` glob filters and can derive watch roots from
+  `--include` when `--watch-dir` is omitted
 - Reliable autonomous watching requires `codex exec ...`
 - Supports `--per-file` mode and `{{file}}`/`{{files}}` template variables
 
 ### `gemini-watch`
 
 - Depends on `gemini`, `jq`, and optionally `fswatch`
+- Supports `--include`/`--exclude` glob filters and can derive watch roots from
+  `--include` when `--watch-dir` is omitted
 - Uses a temporary Gemini `AfterAgent` hook to end each session after a trigger
 - Supports both positional prompts and interactive `-i` sessions
 
 ### `copilot-watch`
 
 - Depends on `copilot`, `jq`, and optionally `fswatch`
+- Supports `--include`/`--exclude` glob filters and can derive watch roots from
+  `--include` when `--watch-dir` is omitted
 - Uses a project-local Copilot `agentStop` hook under `.github/hooks/`
 - Terminates Copilot after each trigger via SIGTERM
 
 ### `cursor-watch`
 
 - Depends on `cursor-agent` and optionally `fswatch`
+- Supports `--include`/`--exclude` glob filters and can derive watch roots from
+  `--include` when `--watch-dir` is omitted
 - Reliable autonomous watching is best with `cursor-agent --print ...`
 
 ### `opencode-watch`
 
 - Depends on `opencode` and optionally `fswatch`
+- Supports `--include`/`--exclude` glob filters and can derive watch roots from
+  `--include` when `--watch-dir` is omitted
 - Reliable autonomous watching is best with `opencode run ...`
 
 ### `cline-watch`
 
 - Depends on `cline` and optionally `fswatch`
+- Supports `--include`/`--exclude` glob filters and can derive watch roots from
+  `--include` when `--watch-dir` is omitted
 - Reliable autonomous watching is best with `cline --oneshot ...`
 
 ## Development

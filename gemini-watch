@@ -17,7 +17,12 @@
 #
 # OPTIONS
 #     --watch-dir DIR
-#         Directory to watch recursively (repeatable, required)
+#         Directory to watch recursively (repeatable, optional)
+#         When omitted, watch roots are derived from --include patterns
+#
+#     --include PATTERN
+#         Glob pattern to include (repeatable)
+#         When omitted, all files under the watch roots are included
 #
 #     --cooldown N
 #         Minimum seconds between Gemini runs. Default: 30
@@ -32,8 +37,11 @@
 #     --max-triggers N
 #         Maximum number of triggers before exiting. Default: 0 (unlimited)
 #
+#     --exclude PATTERN
+#         Glob pattern to exclude (repeatable)
+#
 #     --ignore PATTERN
-#         Additional glob pattern to ignore (repeatable)
+#         Alias for --exclude
 #
 #     --debug
 #         Enable debug logging
@@ -49,8 +57,9 @@
 #
 # EXAMPLES
 #     gemini-watch --watch-dir ./src -- "describe what changed in {{files}}"
-#     gemini-watch --watch-dir ./src --per-file -- "review {{file}}"
-#     gemini-watch --watch-dir ./src --cooldown 10 -- -i "fix issues"
+#     gemini-watch --include './src/**/*.ts' -- "describe what changed in {{files}}"
+#     gemini-watch --include '~/.gemini/**/*.json' --include '~/.codex/sessions/**/*.jsonl' -- "review {{files}}"
+#     gemini-watch --watch-dir ./src --exclude '*.log' --cooldown 10 -- -i "fix issues"
 #
 # DEPENDENCIES
 #     - gemini (Gemini CLI)
@@ -68,6 +77,7 @@ readonly HOOK_SCRIPT_PATH="${HOOKS_DIR}/gemini-watch-hook.sh"
 readonly HOOK_LOG_FILE="${GEMINI_DIR}/gemini-watch-hook.log"
 
 WATCH_DIRS=()
+INCLUDE_PATTERNS=()
 IGNORE_PATTERNS=()
 COOLDOWN_SECONDS=30
 MAX_TRIGGERS=0
@@ -104,7 +114,10 @@ parse_args() {
     case "$1" in
       --watch-dir)
         [[ $# -ge 2 ]] || { log_error "--watch-dir requires a value."; exit 1; }
-        WATCH_DIRS+=("$2"); shift 2 ;;
+        WATCH_DIRS+=("$(expand_leading_tilde "$2")"); shift 2 ;;
+      --include)
+        [[ $# -ge 2 ]] || { log_error "--include requires a value."; exit 1; }
+        INCLUDE_PATTERNS+=("$(expand_leading_tilde "$2")"); shift 2 ;;
       --cooldown)
         [[ $# -ge 2 ]] || { log_error "--cooldown requires a value."; exit 1; }
         COOLDOWN_SECONDS="$2"; shift 2 ;;
@@ -116,8 +129,8 @@ parse_args() {
         MAX_TRIGGERS="$2"; shift 2 ;;
       --per-file)
         PER_FILE=true; shift ;;
-      --ignore)
-        [[ $# -ge 2 ]] || { log_error "--ignore requires a value."; exit 1; }
+      --exclude|--ignore)
+        [[ $# -ge 2 ]] || { log_error "$1 requires a value."; exit 1; }
         IGNORE_PATTERNS+=("$2"); shift 2 ;;
       --debug)
         DEBUG=true; shift ;;
@@ -131,13 +144,236 @@ parse_args() {
   done
 }
 
+expand_leading_tilde() {
+  local value="$1"
+  case "$value" in
+    "~")
+      printf '%s\n' "$HOME"
+      ;;
+    "~/"*)
+      printf '%s\n' "$HOME/${value#"~/"}"
+      ;;
+    *)
+      printf '%s\n' "$value"
+      ;;
+  esac
+}
+
+strip_trailing_slashes() {
+  local value="$1"
+  while [[ "$value" != "/" && "$value" == */ ]]; do
+    value="${value%/}"
+  done
+  printf '%s\n' "$value"
+}
+
+pattern_has_glob() {
+  [[ "$1" == *[\*\?\[]* ]]
+}
+
+derive_watch_dir_from_pattern() {
+  local pattern="$1"
+  local prefix fallback
+
+  if [[ "$pattern" =~ ^([^*?\[]*) ]]; then
+    prefix="${BASH_REMATCH[1]}"
+  else
+    prefix="$pattern"
+  fi
+
+  if [[ -z "$prefix" ]]; then
+    if [[ "$pattern" == /* ]]; then
+      printf '/\n'
+    else
+      printf '.\n'
+    fi
+    return
+  fi
+
+  prefix=$(strip_trailing_slashes "$prefix")
+  if [[ -z "$prefix" ]]; then
+    if [[ "$pattern" == /* ]]; then
+      printf '/\n'
+    else
+      printf '.\n'
+    fi
+    return
+  fi
+
+  if [[ -d "$prefix" ]]; then
+    printf '%s\n' "$prefix"
+    return
+  fi
+
+  if ! pattern_has_glob "$pattern" && [[ -e "$prefix" && ! -d "$prefix" ]]; then
+    prefix=$(dirname -- "$prefix")
+  fi
+
+  fallback="."
+  [[ "$pattern" == /* ]] && fallback="/"
+
+  while [[ ! -d "$prefix" ]]; do
+    local parent
+    parent=$(dirname -- "$prefix")
+    [[ "$parent" == "$prefix" ]] && break
+    prefix="$parent"
+  done
+
+  if [[ -d "$prefix" ]]; then
+    printf '%s\n' "$prefix"
+  else
+    printf '%s\n' "$fallback"
+  fi
+}
+
+add_default_watch_dirs() {
+  local pattern derived
+  if [[ ${#WATCH_DIRS[@]} -eq 0 && ${#INCLUDE_PATTERNS[@]} -eq 0 ]]; then
+    WATCH_DIRS+=(".")
+  fi
+  for pattern in "${INCLUDE_PATTERNS[@]}"; do
+    derived=$(derive_watch_dir_from_pattern "$pattern")
+    WATCH_DIRS+=("$derived")
+  done
+}
+
+dedupe_watch_dirs() {
+  local dir existing
+  local unique=()
+  for dir in "${WATCH_DIRS[@]}"; do
+    dir=$(strip_trailing_slashes "$dir")
+    [[ -z "$dir" ]] && dir="."
+    local seen=false
+    for existing in "${unique[@]+"${unique[@]}"}"; do
+      if [[ "$existing" == "$dir" ]]; then
+        seen=true
+        break
+      fi
+    done
+    if [[ "$seen" == "false" ]]; then
+      unique+=("$dir")
+    fi
+  done
+  WATCH_DIRS=("${unique[@]}")
+}
+
+path_to_absolute() {
+  local path="$1"
+  path=$(expand_leading_tilde "$path")
+  case "$path" in
+    /*) printf '%s\n' "$path" ;;
+    .) printf '%s\n' "$PWD" ;;
+    ./*) printf '%s\n' "$PWD/${path#./}" ;;
+    *) printf '%s\n' "$PWD/$path" ;;
+  esac
+}
+
+path_relative_to_pwd() {
+  local path="$1"
+  local abs_pwd="${PWD%/}"
+  local abs_path
+  abs_path=$(path_to_absolute "$path")
+  if [[ "$abs_path" == "$abs_pwd" ]]; then
+    printf '.\n'
+  elif [[ "$abs_path" == "$abs_pwd/"* ]]; then
+    printf '%s\n' "${abs_path#"$abs_pwd"/}"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
+path_is_within() {
+  local path="$1"
+  local base="$2"
+  local abs_path abs_base
+  abs_path=$(path_to_absolute "$path")
+  abs_base=$(path_to_absolute "$base")
+  [[ "$abs_path" == "$abs_base" || "$abs_path" == "$abs_base/"* ]]
+}
+
+value_matches_glob_pattern() {
+  local prefix="$1"
+  local value="$2"
+  local remaining="$3"
+
+  if [[ "$remaining" == *'**/'* ]]; then
+    local before="${remaining%%'**/'*}"
+    local after="${remaining#*'**/'}"
+    value_matches_glob_pattern "${prefix}${before}**/" "$value" "$after" && return 0
+    value_matches_glob_pattern "${prefix}${before}" "$value" "$after" && return 0
+    return 1
+  fi
+
+  [[ "$value" == ${prefix}${remaining} ]]
+}
+
+path_matches_pattern() {
+  local path="$1"
+  local pattern="$2"
+  local abs_path rel_path basename
+  abs_path=$(path_to_absolute "$path")
+  rel_path=$(path_relative_to_pwd "$path")
+  basename=$(basename -- "$path")
+  value_matches_glob_pattern "" "$path" "$pattern" \
+    || value_matches_glob_pattern "" "$abs_path" "$pattern" \
+    || value_matches_glob_pattern "" "$rel_path" "$pattern" \
+    || value_matches_glob_pattern "" "$basename" "$pattern"
+}
+
+should_skip_path() {
+  local path="$1"
+  [[ "$(basename -- "$path")" == ".DS_Store" ]] && return 0
+  path_is_within "$path" "$GEMINI_DIR"
+}
+
+should_track_path() {
+  local path="$1"
+  local pattern
+
+  should_skip_path "$path" && return 1
+
+  if [[ ${#INCLUDE_PATTERNS[@]} -gt 0 ]]; then
+    local matched=false
+    for pattern in "${INCLUDE_PATTERNS[@]}"; do
+      if path_matches_pattern "$path" "$pattern"; then
+        matched=true
+        break
+      fi
+    done
+    [[ "$matched" == "true" ]] || return 1
+  fi
+
+  for pattern in "${IGNORE_PATTERNS[@]+"${IGNORE_PATTERNS[@]}"}"; do
+    if path_matches_pattern "$path" "$pattern"; then
+      return 1
+    fi
+  done
+
+  return 0
+}
+
+filter_changed_files() {
+  local raw_changes="$1"
+  local line filtered=""
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    [[ -f "$line" ]] || continue
+    should_track_path "$line" || continue
+    filtered+="$line"$'\n'
+  done <<< "$raw_changes"
+
+  CHANGED_FILES="${filtered%$'\n'}"
+}
+
 validate_config() {
-  [[ ${#WATCH_DIRS[@]} -gt 0 ]] || { log_error "--watch-dir is required."; exit 1; }
   [[ "$COOLDOWN_SECONDS" =~ ^[0-9]+$ ]] || { log_error "cooldown must be a non-negative integer."; exit 1; }
   [[ "$MAX_TRIGGERS" =~ ^[0-9]+$ ]] || { log_error "max-triggers must be a non-negative integer."; exit 1; }
+  add_default_watch_dirs
+  dedupe_watch_dirs
   local normalized=()
   for dir in "${WATCH_DIRS[@]}"; do
-    dir="${dir%/}"
+    dir=$(strip_trailing_slashes "$dir")
     [[ -d "$dir" ]] || { log_error "watch directory does not exist: $dir"; exit 1; }
     normalized+=("$dir")
   done
@@ -294,15 +530,17 @@ wait_for_changes_fswatch() {
     fswatch_args+=(--exclude "$pattern")
   done
   fswatch_args+=("${WATCH_DIRS[@]}")
-  log "waiting for changes (fswatch)..."
-  local changed
-  changed=$(fswatch "${fswatch_args[@]}" 2>/dev/null) || return 1
-  if [[ -n "$changed" ]]; then
-    CHANGED_FILES="$changed"
-    log "changed files: $(echo "$changed" | head -5 | tr '\n' ' ')"
-    return 0
-  fi
-  return 1
+  while true; do
+    log "waiting for changes (fswatch)..."
+    local changed
+    changed=$(fswatch "${fswatch_args[@]}" 2>/dev/null) || return 1
+    filter_changed_files "$changed"
+    if [[ -n "$CHANGED_FILES" ]]; then
+      log "changed files: $(echo "$CHANGED_FILES" | head -5 | tr '\n' ' ')"
+      return 0
+    fi
+    log "changes matched no include/exclude filters, continuing to watch"
+  done
 }
 
 wait_for_changes_poll() {
@@ -316,17 +554,17 @@ wait_for_changes_poll() {
     local find_args=()
     for dir in "${WATCH_DIRS[@]}"; do find_args+=("$dir"); done
     find_args+=(-newer "$SENTINEL_FILE" -not -path "${GEMINI_DIR}/*" -not -name '.DS_Store')
-    for pattern in "${IGNORE_PATTERNS[@]+"${IGNORE_PATTERNS[@]}"}"; do
-      find_args+=(-not -name "$pattern")
-    done
     find_args+=(-type f)
     local changed
     changed=$(find "${find_args[@]}" 2>/dev/null || true)
     if [[ -n "$changed" ]]; then
       touch "$SENTINEL_FILE"
-      CHANGED_FILES="$changed"
-      log "changed files: $(echo "$changed" | head -5 | tr '\n' ' ')"
-      return 0
+      filter_changed_files "$changed"
+      if [[ -n "$CHANGED_FILES" ]]; then
+        log "changed files: $(echo "$CHANGED_FILES" | head -5 | tr '\n' ' ')"
+        return 0
+      fi
+      log "changes matched no include/exclude filters, continuing to watch"
     fi
   done
 }
@@ -344,16 +582,15 @@ check_changes_during_run() {
   local find_args=()
   for dir in "${WATCH_DIRS[@]}"; do find_args+=("$dir"); done
   find_args+=(-newer "$PRE_RUN_SENTINEL" -not -path "${GEMINI_DIR}/*" -not -name '.DS_Store')
-  for pattern in "${IGNORE_PATTERNS[@]+"${IGNORE_PATTERNS[@]}"}"; do
-    find_args+=(-not -name "$pattern")
-  done
   find_args+=(-type f)
   local changed
   changed=$(find "${find_args[@]}" 2>/dev/null || true)
   if [[ -n "$changed" ]]; then
-    CHANGED_FILES="$changed"
-    log "changes detected during gemini run: $(echo "$changed" | head -5 | tr '\n' ' ')"
-    return 0
+    filter_changed_files "$changed"
+    if [[ -n "$CHANGED_FILES" ]]; then
+      log "changes detected during gemini run: $(echo "$CHANGED_FILES" | head -5 | tr '\n' ' ')"
+      return 0
+    fi
   fi
   return 1
 }
@@ -432,7 +669,7 @@ main() {
 
   trap cleanup EXIT INT TERM
 
-  log "watch_dirs=${WATCH_DIRS[*]} cooldown=${COOLDOWN_SECONDS}s max_triggers=$MAX_TRIGGERS per_file=$PER_FILE completion_promise=${COMPLETION_PROMISE:-<none>}"
+  log "watch_dirs=${WATCH_DIRS[*]} include_patterns=${INCLUDE_PATTERNS[*]:-<none>} exclude_patterns=${IGNORE_PATTERNS[*]:-<none>} cooldown=${COOLDOWN_SECONDS}s max_triggers=$MAX_TRIGGERS per_file=$PER_FILE completion_promise=${COMPLETION_PROMISE:-<none>}"
 
   create_hook_script
   merge_settings
