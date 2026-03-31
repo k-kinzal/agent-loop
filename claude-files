@@ -1,0 +1,553 @@
+#!/usr/bin/env bash
+#
+# claude-files - Run Claude Code once per file from a file list
+#
+# USAGE
+#     claude-files [OPTIONS] [--] [CLAUDE_ARGS...]
+#
+# DESCRIPTION
+#     Reads newline-delimited file paths from one or more file lists and
+#     launches Claude Code once per line. Claude runs under a managed Stop
+#     hook so the wrapper regains control after each completed turn and starts
+#     the next file in a fresh session.
+#
+#     Relative paths in the file list are resolved from the current working
+#     directory.
+#
+# OPTIONS
+#     --files-from PATH
+#         Read newline-delimited file paths from PATH. Repeatable.
+#         Use `-` to read from stdin. When omitted, stdin is used if available.
+#
+#     --include PATTERN
+#         Glob pattern to include (repeatable)
+#         When omitted, all listed files are included
+#
+#     --exclude PATTERN
+#         Glob pattern to exclude (repeatable)
+#
+#     --ignore PATTERN
+#         Alias for --exclude
+#
+#     --max-files N
+#         Stop after N matching files. Default: 0 (all)
+#
+#     --completion-promise TEXT
+#         Stop after a Claude run whose final response contains TEXT
+#
+#     --debug
+#         Enable debug logging (both claude-files and claude)
+#
+#     --help, -h
+#         Show this help message
+#
+#     All other options are passed through to claude.
+#
+# TEMPLATE VARIABLES
+#     {{file}}    Replaced with the current file path
+#     {{files}}   Replaced with the current file path for compatibility with
+#                 `*-watch` prompts
+#
+# EXAMPLES
+#     claude-files --files-from files.txt -- -p "review {{file}}"
+#     printf '%s\n' src/a.ts src/b.ts | claude-files -- -p "fix {{file}}"
+#     claude-files --files-from files.txt --max-files 10 -- "analyze {{file}}"
+#
+# DEPENDENCIES
+#     - claude (Claude Code CLI)
+#     - jq (JSON processor)
+#
+
+set -euo pipefail
+
+readonly CLAUDE_DIR="${PWD}/.claude"
+readonly HOOKS_DIR="${CLAUDE_DIR}/hooks"
+readonly STATE_FILE="${CLAUDE_DIR}/claude-files.state.json"
+readonly SETTINGS_LOCAL="${CLAUDE_DIR}/settings.local.json"
+readonly SETTINGS_PROJECT="${CLAUDE_DIR}/settings.json"
+readonly HOOK_SCRIPT_PATH="${HOOKS_DIR}/claude-files-hook.sh"
+readonly HOOK_LOG_FILE="${CLAUDE_DIR}/claude-files-hook.log"
+readonly EXISTING_HOOKS_FILE="${CLAUDE_DIR}/claude-files-existing-hooks.json"
+
+FILES_FROM=()
+INCLUDE_PATTERNS=()
+IGNORE_PATTERNS=()
+MAX_FILES=0
+COMPLETION_PROMISE=""
+CLAUDE_ARGS=()
+INPUT_FILES=()
+SETTINGS_MODIFIED=false
+TARGET_SETTINGS_FILE=""
+TARGET_SETTINGS_BACKUP=""
+DEBUG=false
+PROCESSED_COUNT=0
+
+log() { [[ "$DEBUG" == "true" ]] && echo "[claude-files] $1" >&2 || true; }
+log_error() { echo "[claude-files] ERROR: $1" >&2; }
+
+show_usage() {
+  awk '
+    NR >= 2 {
+      if ($0 !~ /^#/) {
+        exit
+      }
+      sub(/^# ?/, "")
+      print
+    }
+  ' "$0"
+}
+
+check_dependencies() {
+  command -v jq >/dev/null 2>&1 || { log_error "jq is required but not installed."; exit 1; }
+  command -v claude >/dev/null 2>&1 || { log_error "claude CLI is required but not installed."; exit 1; }
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --files-from)
+        [[ $# -ge 2 ]] || { log_error "--files-from requires a value."; exit 1; }
+        FILES_FROM+=("$(expand_leading_tilde "$2")"); shift 2 ;;
+      --include)
+        [[ $# -ge 2 ]] || { log_error "--include requires a value."; exit 1; }
+        INCLUDE_PATTERNS+=("$(expand_leading_tilde "$2")"); shift 2 ;;
+      --exclude|--ignore)
+        [[ $# -ge 2 ]] || { log_error "$1 requires a value."; exit 1; }
+        IGNORE_PATTERNS+=("$(expand_leading_tilde "$2")"); shift 2 ;;
+      --max-files)
+        [[ $# -ge 2 ]] || { log_error "--max-files requires a value."; exit 1; }
+        MAX_FILES="$2"; shift 2 ;;
+      --completion-promise)
+        [[ $# -ge 2 ]] || { log_error "--completion-promise requires a value."; exit 1; }
+        COMPLETION_PROMISE="$2"; shift 2 ;;
+      --debug)
+        DEBUG=true; CLAUDE_ARGS+=("$1"); shift ;;
+      --help|-h)
+        show_usage; exit 0 ;;
+      --)
+        shift; CLAUDE_ARGS+=("$@"); break ;;
+      *)
+        CLAUDE_ARGS+=("$1"); shift ;;
+    esac
+  done
+}
+
+expand_leading_tilde() {
+  local value="$1"
+  case "$value" in
+    "~") printf '%s\n' "$HOME" ;;
+    "~/"*) printf '%s\n' "$HOME/${value#"~/"}" ;;
+    *) printf '%s\n' "$value" ;;
+  esac
+}
+
+path_to_absolute() {
+  local path="$1"
+  path=$(expand_leading_tilde "$path")
+  case "$path" in
+    /*) printf '%s\n' "$path" ;;
+    .) printf '%s\n' "$PWD" ;;
+    ./*) printf '%s\n' "$PWD/${path#./}" ;;
+    *) printf '%s\n' "$PWD/$path" ;;
+  esac
+}
+
+path_relative_to_pwd() {
+  local path="$1"
+  local abs_pwd="${PWD%/}"
+  local abs_path
+  abs_path=$(path_to_absolute "$path")
+  if [[ "$abs_path" == "$abs_pwd" ]]; then
+    printf '.\n'
+  elif [[ "$abs_path" == "$abs_pwd/"* ]]; then
+    printf '%s\n' "${abs_path#"$abs_pwd"/}"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
+value_matches_glob_pattern() {
+  local prefix="$1"
+  local value="$2"
+  local remaining="$3"
+
+  if [[ "$remaining" == *'**/'* ]]; then
+    local before="${remaining%%'**/'*}"
+    local after="${remaining#*'**/'}"
+    value_matches_glob_pattern "${prefix}${before}**/" "$value" "$after" && return 0
+    value_matches_glob_pattern "${prefix}${before}" "$value" "$after" && return 0
+    return 1
+  fi
+
+  [[ "$value" == ${prefix}${remaining} ]]
+}
+
+path_matches_pattern() {
+  local path="$1"
+  local pattern="$2"
+  local abs_path rel_path basename
+  abs_path=$(path_to_absolute "$path")
+  rel_path=$(path_relative_to_pwd "$path")
+  basename=$(basename -- "$path")
+  value_matches_glob_pattern "" "$path" "$pattern" \
+    || value_matches_glob_pattern "" "$abs_path" "$pattern" \
+    || value_matches_glob_pattern "" "$rel_path" "$pattern" \
+    || value_matches_glob_pattern "" "$basename" "$pattern"
+}
+
+should_skip_path() {
+  local path="$1"
+  [[ "$(basename -- "$path")" == ".DS_Store" ]]
+}
+
+should_track_path() {
+  local path="$1"
+  local pattern
+
+  should_skip_path "$path" && return 1
+
+  if [[ ${#INCLUDE_PATTERNS[@]} -gt 0 ]]; then
+    local matched=false
+    for pattern in "${INCLUDE_PATTERNS[@]}"; do
+      if path_matches_pattern "$path" "$pattern"; then
+        matched=true
+        break
+      fi
+    done
+    [[ "$matched" == "true" ]] || return 1
+  fi
+
+  for pattern in "${IGNORE_PATTERNS[@]+"${IGNORE_PATTERNS[@]}"}"; do
+    if path_matches_pattern "$path" "$pattern"; then
+      return 1
+    fi
+  done
+
+  return 0
+}
+
+process_file_list() {
+  local source="$1"
+  local line path
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -n "$line" ]] || continue
+    path=$(expand_leading_tilde "$line")
+    if [[ ! -f "$path" ]]; then
+      log "skipping missing or non-regular file from $source: $line"
+      continue
+    fi
+    if ! should_track_path "$path"; then
+      log "skipping filtered file from $source: $path"
+      continue
+    fi
+    INPUT_FILES+=("$path")
+  done
+}
+
+collect_input_files() {
+  local source
+
+  if [[ ${#FILES_FROM[@]} -eq 0 ]]; then
+    if [[ -t 0 ]]; then
+      log_error "no file list provided. Use --files-from PATH or pipe newline-delimited paths on stdin."
+      exit 1
+    fi
+    FILES_FROM=("-")
+  fi
+
+  for source in "${FILES_FROM[@]}"; do
+    if [[ "$source" == "-" ]]; then
+      log "reading file list from stdin"
+      process_file_list "stdin"
+    else
+      [[ -f "$source" ]] || { log_error "file list does not exist: $source"; exit 1; }
+      log "reading file list from $source"
+      process_file_list "$source" < "$source"
+    fi
+  done
+
+  [[ ${#INPUT_FILES[@]} -gt 0 ]] || { log_error "no matching files found in the provided file list."; exit 1; }
+}
+
+validate_config() {
+  [[ "$MAX_FILES" =~ ^[0-9]+$ ]] || { log_error "max-files must be a non-negative integer."; exit 1; }
+}
+
+write_state() {
+  local decision="${1:-null}"
+  local hook_called="${2:-false}"
+  mkdir -p "$CLAUDE_DIR"
+  cat > "$STATE_FILE" << EOF
+{
+  "active": true,
+  "completion_promise": $(printf '%s' "$COMPLETION_PROMISE" | jq -Rs .),
+  "decision": $(if [ "$decision" = "null" ]; then echo "null"; else echo "\"$decision\""; fi),
+  "hook_called": $hook_called
+}
+EOF
+}
+
+read_decision() {
+  [[ -f "$STATE_FILE" ]] && jq -r '.decision // "null"' "$STATE_FILE" || echo "null"
+}
+
+read_hook_called() {
+  [[ -f "$STATE_FILE" ]] && jq -r '.hook_called // false' "$STATE_FILE" || echo "false"
+}
+
+create_hook_script() {
+  mkdir -p "$HOOKS_DIR"
+  cat > "$HOOK_SCRIPT_PATH" << 'HOOKEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_FILE="${CLAUDE_PROJECT_DIR}/.claude/claude-files.state.json"
+DEBUG_FLAG_FILE="${CLAUDE_PROJECT_DIR}/.claude/claude-files.debug"
+HOOK_LOG_FILE="${CLAUDE_PROJECT_DIR}/.claude/claude-files-hook.log"
+EXISTING_HOOKS_FILE="${CLAUDE_PROJECT_DIR}/.claude/claude-files-existing-hooks.json"
+
+debug_log() {
+  [[ -f "$DEBUG_FLAG_FILE" ]] || return 0
+  mkdir -p "$(dirname "$HOOK_LOG_FILE")"
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$HOOK_LOG_FILE"
+}
+
+INPUT=$(cat)
+
+if [[ -f "$EXISTING_HOOKS_FILE" ]] && [[ "$(jq 'length' "$EXISTING_HOOKS_FILE")" -gt 0 ]]; then
+  HOOK_COUNT=$(jq 'length' "$EXISTING_HOOKS_FILE")
+  debug_log "Running $HOOK_COUNT existing hook(s) before claude-files logic"
+  for ((i=0; i<HOOK_COUNT; i++)); do
+    HOOK_CMD=$(jq -r ".[$i]" "$EXISTING_HOOKS_FILE")
+    debug_log "Running existing hook $((i+1))/$HOOK_COUNT: $HOOK_CMD"
+    RESULT=""
+    RESULT=$(printf '%s' "$INPUT" | eval "$HOOK_CMD" 2>/dev/null) || true
+    if [[ -n "$RESULT" ]]; then
+      HOOK_CONTINUE=$(printf '%s' "$RESULT" | jq -r '.continue // "null"' 2>/dev/null) || HOOK_CONTINUE="null"
+      if [[ "$HOOK_CONTINUE" != "false" ]]; then
+        debug_log "Existing hook $((i+1)) blocked stop (continue=$HOOK_CONTINUE), forwarding with continue=true"
+        printf '%s' "$RESULT" | jq -c '. + {"continue": true}'
+        exit 0
+      fi
+    fi
+    debug_log "Existing hook $((i+1)) passed"
+  done
+  debug_log "All $HOOK_COUNT existing hook(s) passed, proceeding with claude-files logic"
+fi
+
+[[ ! -f "$STATE_FILE" ]] && exit 0
+
+STATE=$(cat "$STATE_FILE")
+[[ $(echo "$STATE" | jq -r '.active // false') != "true" ]] && exit 0
+
+COMPLETION_PROMISE=$(echo "$STATE" | jq -r '.completion_promise // ""')
+LAST_ASSISTANT_MESSAGE=$(echo "$INPUT" | jq -r '.last_assistant_message // empty')
+TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path // empty')
+ASSISTANT_TEXT="$LAST_ASSISTANT_MESSAGE"
+
+debug_log "Stop hook started: completion_promise=${COMPLETION_PROMISE:-<none>} transcript_path=${TRANSCRIPT_PATH:-<none>}"
+
+if [[ -z "$ASSISTANT_TEXT" ]] && [[ -n "$TRANSCRIPT_PATH" ]] && [[ -f "$TRANSCRIPT_PATH" ]]; then
+  ASSISTANT_TEXT=$(jq -r '
+    select(.type == "assistant")
+    | .message.content[]?
+    | select(.type == "text")
+    | .text // empty
+  ' "$TRANSCRIPT_PATH" 2>/dev/null | tail -n 1 || true)
+fi
+
+DECISION="done"
+if [[ -n "$COMPLETION_PROMISE" ]] && [[ -n "$ASSISTANT_TEXT" ]] && grep -qF -- "$COMPLETION_PROMISE" <<< "$ASSISTANT_TEXT"; then
+  DECISION="complete"
+  debug_log "decision=complete (completion promise matched)"
+else
+  debug_log "decision=done"
+fi
+
+jq --arg d "$DECISION" '.decision = $d | .hook_called = true' \
+  "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+
+CLAUDE_PID=$(ps -o ppid= $$ 2>/dev/null | tr -d ' ')
+if [[ -n "$CLAUDE_PID" ]]; then
+  debug_log "sending SIGTERM to claude process (PID=$CLAUDE_PID)"
+  kill -TERM "$CLAUDE_PID" 2>/dev/null || true
+fi
+exit 0
+HOOKEOF
+
+  chmod +x "$HOOK_SCRIPT_PATH"
+  if [[ "$DEBUG" == "true" ]]; then
+    touch "${CLAUDE_DIR}/claude-files.debug"
+  fi
+}
+
+extract_existing_stop_hooks() {
+  local hooks_json="[]"
+  if [[ -f "$TARGET_SETTINGS_FILE" ]] && jq -e '.hooks.Stop' "$TARGET_SETTINGS_FILE" >/dev/null 2>&1; then
+    hooks_json=$(jq '[.hooks.Stop[]?.hooks[]? | select(.type == "command") | .command]' "$TARGET_SETTINGS_FILE")
+  fi
+  echo "$hooks_json" > "$EXISTING_HOOKS_FILE"
+  log "extracted existing stop hooks: $(cat "$EXISTING_HOOKS_FILE")"
+}
+
+merge_settings() {
+  mkdir -p "$CLAUDE_DIR"
+
+  local hook_entry='{"hooks":[{"type":"command","command":"\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/claude-files-hook.sh"}]}'
+
+  if [[ -f "$SETTINGS_PROJECT" ]] && jq -e '.hooks.Stop' "$SETTINGS_PROJECT" >/dev/null 2>&1; then
+    TARGET_SETTINGS_FILE="$SETTINGS_PROJECT"
+  else
+    TARGET_SETTINGS_FILE="$SETTINGS_LOCAL"
+  fi
+  TARGET_SETTINGS_BACKUP="${TARGET_SETTINGS_FILE}.claude-files-backup"
+
+  if [[ -f "$TARGET_SETTINGS_FILE" ]]; then
+    cp "$TARGET_SETTINGS_FILE" "$TARGET_SETTINGS_BACKUP"
+  fi
+
+  extract_existing_stop_hooks
+
+  if [[ -f "$TARGET_SETTINGS_FILE" ]]; then
+    local existing
+    existing=$(cat "$TARGET_SETTINGS_FILE")
+    if echo "$existing" | jq -e '.hooks' >/dev/null 2>&1; then
+      echo "$existing" | jq --argjson hook "$hook_entry" '.hooks.Stop = [$hook]' > "$TARGET_SETTINGS_FILE"
+    else
+      echo "$existing" | jq --argjson hook "$hook_entry" '.hooks = {"Stop": [$hook]}' > "$TARGET_SETTINGS_FILE"
+    fi
+  else
+    cat > "$TARGET_SETTINGS_FILE" << 'EOF'
+{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/claude-files-hook.sh"}]}]}}
+EOF
+  fi
+
+  SETTINGS_MODIFIED=true
+  log "hook registered in $(basename "$TARGET_SETTINGS_FILE")"
+}
+
+restore_settings() {
+  if [[ "$SETTINGS_MODIFIED" == "true" ]] && [[ -n "$TARGET_SETTINGS_FILE" ]]; then
+    if [[ -f "$TARGET_SETTINGS_BACKUP" ]]; then
+      mv "$TARGET_SETTINGS_BACKUP" "$TARGET_SETTINGS_FILE"
+    else
+      rm -f "$TARGET_SETTINGS_FILE"
+    fi
+    SETTINGS_MODIFIED=false
+  fi
+}
+
+cleanup() {
+  local exit_code=$?
+  rm -f "$HOOK_SCRIPT_PATH"
+  rm -f "${CLAUDE_DIR}/claude-files.debug"
+  rm -f "$EXISTING_HOOKS_FILE"
+  rm -f "$HOOK_LOG_FILE"
+  rmdir "$HOOKS_DIR" 2>/dev/null || true
+  restore_settings
+  rm -f "$STATE_FILE"
+  exit "$exit_code"
+}
+
+expand_template() {
+  local current_file="$1"
+  EXPANDED_ARGS=()
+  for arg in "${CLAUDE_ARGS[@]}"; do
+    arg="${arg//\{\{files\}\}/$current_file}"
+    arg="${arg//\{\{file\}\}/$current_file}"
+    EXPANDED_ARGS+=("$arg")
+  done
+}
+
+run_claude_once() {
+  local -a args=("$@")
+  log "claude args (${#args[@]}): $(printf "'%s' " "${args[@]}")"
+
+  write_state "null" "false"
+
+  set +e
+  claude "${args[@]}"
+  local claude_exit_code=$?
+  set -e
+
+  local decision hook_called
+  decision=$(read_decision)
+  hook_called=$(read_hook_called)
+
+  log "claude exited (code=$claude_exit_code, decision=$decision, hook=$hook_called)"
+
+  LAST_EXIT_CODE=$claude_exit_code
+  LAST_DECISION=$decision
+  LAST_HOOK_CALLED=$hook_called
+}
+
+eval_run_result() {
+  if [[ "$LAST_HOOK_CALLED" != "true" ]]; then
+    case "$LAST_EXIT_CODE" in
+      129|130|137|143)
+        log "interrupted by signal while processing $CURRENT_FILE"
+        WRAPPER_EXIT_CODE=$LAST_EXIT_CODE
+        return 1
+        ;;
+    esac
+    log "hook not called; exiting with claude's status"
+    WRAPPER_EXIT_CODE=$LAST_EXIT_CODE
+    return 1
+  fi
+
+  case "$LAST_DECISION" in
+    complete)
+      log "completion promise matched after file $PROCESSED_COUNT"
+      WRAPPER_EXIT_CODE=0
+      return 1
+      ;;
+    done)
+      return 0
+      ;;
+    *)
+      log_error "unexpected decision: $LAST_DECISION"
+      WRAPPER_EXIT_CODE=1
+      return 1
+      ;;
+  esac
+}
+
+main() {
+  parse_args "$@"
+  validate_config
+  check_dependencies
+  collect_input_files
+
+  if [[ ${#CLAUDE_ARGS[@]} -eq 0 ]]; then
+    log_error "no arguments provided for claude. See --help for usage."
+    exit 1
+  fi
+
+  trap cleanup EXIT INT TERM
+
+  log "files=${#INPUT_FILES[@]} include_patterns=${INCLUDE_PATTERNS[*]:-<none>} exclude_patterns=${IGNORE_PATTERNS[*]:-<none>} max_files=$MAX_FILES completion_promise=${COMPLETION_PROMISE:-<none>}"
+
+  create_hook_script
+  merge_settings
+
+  WRAPPER_EXIT_CODE=0
+
+  for CURRENT_FILE in "${INPUT_FILES[@]}"; do
+    if [[ "$MAX_FILES" -gt 0 ]] && [[ "$PROCESSED_COUNT" -ge "$MAX_FILES" ]]; then
+      log "maximum files reached: $MAX_FILES"
+      break
+    fi
+
+    PROCESSED_COUNT=$((PROCESSED_COUNT + 1))
+    log "processing file $PROCESSED_COUNT/${#INPUT_FILES[@]}: $CURRENT_FILE"
+    expand_template "$CURRENT_FILE"
+    run_claude_once "${EXPANDED_ARGS[@]}"
+    if ! eval_run_result; then
+      return "$WRAPPER_EXIT_CODE"
+    fi
+  done
+}
+
+main "$@"

@@ -1,0 +1,467 @@
+#!/usr/bin/env bash
+#
+# cursor-files - Run Cursor Agent CLI once per file from a file list
+#
+# USAGE
+#     cursor-files [OPTIONS] [--] [CURSOR_ARGS...]
+#
+# DESCRIPTION
+#     Reads newline-delimited file paths from one or more file lists and
+#     launches Cursor Agent once per line. Each run starts as a fresh process,
+#     so every file is handled in a new session.
+#
+#     Relative paths in the file list are resolved from the current working
+#     directory. Cursor Agent should be run in a mode that exits on completion
+#     (for example `cursor-agent --print`) for autonomous processing to work.
+#
+# OPTIONS
+#     --files-from PATH
+#         Read newline-delimited file paths from PATH. Repeatable.
+#         Use `-` to read from stdin. When omitted, stdin is used if available.
+#
+#     --include PATTERN
+#         Glob pattern to include (repeatable)
+#         When omitted, all listed files are included
+#
+#     --exclude PATTERN
+#         Glob pattern to exclude (repeatable)
+#
+#     --ignore PATTERN
+#         Alias for --exclude
+#
+#     --max-files N
+#         Stop after N matching files. Default: 0 (all)
+#
+#     --completion-promise TEXT
+#     --loop-completion-promise TEXT
+#         Stop after a run whose output contains TEXT
+#         Note: promise matching is best-effort for full-screen TUI sessions
+#
+#     --debug
+#     --loop-debug
+#         Enable debug logging
+#
+#     --help, -h
+#         Show this help message
+#
+#     All other options are passed through to cursor-agent.
+#
+# TEMPLATE VARIABLES
+#     {{file}}    Replaced with the current file path
+#     {{files}}   Replaced with the current file path for compatibility with
+#                 `*-watch` prompts
+#
+# EXAMPLES
+#     cursor-files --files-from files.txt -- --print "review {{file}}"
+#     printf '%s\n' src/a.ts src/b.ts | cursor-files -- --print "fix {{file}}"
+#     cursor-files --files-from files.txt --max-files 10 -- --print "analyze {{file}}"
+#
+# DEPENDENCIES
+#     - cursor-agent
+#     - script (only needed for interactive completion-promise capture)
+#
+
+set -euo pipefail
+
+readonly WRAPPER_NAME="cursor-files"
+readonly AGENT_NAME="Cursor Agent CLI"
+: "${CURSOR_FILES_BIN:=cursor-agent}"
+readonly AGENT_BIN="$CURSOR_FILES_BIN"
+
+FILES_FROM=()
+INCLUDE_PATTERNS=()
+IGNORE_PATTERNS=()
+MAX_FILES=0
+COMPLETION_PROMISE=""
+DEBUG=false
+AGENT_ARGS=()
+INPUT_FILES=()
+TRANSCRIPT_FILE=""
+FAILED_RUNS=0
+PROCESSED_COUNT=0
+
+log() {
+  [[ "$DEBUG" == "true" ]] && printf '[%s] %s\n' "$WRAPPER_NAME" "$1" >&2 || true
+}
+
+log_error() {
+  printf '[%s] ERROR: %s\n' "$WRAPPER_NAME" "$1" >&2
+}
+
+show_usage() {
+  awk '
+    NR >= 2 {
+      if ($0 !~ /^#/) {
+        exit
+      }
+      sub(/^# ?/, "")
+      print
+    }
+  ' "$0"
+}
+
+check_dependencies() {
+  command -v "$AGENT_BIN" >/dev/null 2>&1 || {
+    log_error "$AGENT_NAME executable not found: $AGENT_BIN"
+    exit 1
+  }
+
+  if [[ -n "$COMPLETION_PROMISE" ]] && [[ -t 0 && -t 1 ]]; then
+    command -v script >/dev/null 2>&1 || {
+      log_error "script is required for interactive completion-promise capture."
+      exit 1
+    }
+  fi
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --files-from)
+        [[ $# -ge 2 ]] || {
+          log_error "--files-from requires a value."
+          exit 1
+        }
+        FILES_FROM+=("$(expand_leading_tilde "$2")")
+        shift 2
+        ;;
+      --include)
+        [[ $# -ge 2 ]] || {
+          log_error "--include requires a value."
+          exit 1
+        }
+        INCLUDE_PATTERNS+=("$(expand_leading_tilde "$2")")
+        shift 2
+        ;;
+      --exclude|--ignore)
+        [[ $# -ge 2 ]] || {
+          log_error "$1 requires a value."
+          exit 1
+        }
+        IGNORE_PATTERNS+=("$(expand_leading_tilde "$2")")
+        shift 2
+        ;;
+      --max-files)
+        [[ $# -ge 2 ]] || {
+          log_error "--max-files requires a value."
+          exit 1
+        }
+        MAX_FILES="$2"
+        shift 2
+        ;;
+      --completion-promise|--loop-completion-promise)
+        [[ $# -ge 2 ]] || {
+          log_error "$1 requires a value."
+          exit 1
+        }
+        COMPLETION_PROMISE="$2"
+        shift 2
+        ;;
+      --debug|--loop-debug)
+        DEBUG=true
+        shift
+        ;;
+      --help|-h)
+        show_usage
+        exit 0
+        ;;
+      --)
+        shift
+        AGENT_ARGS+=("$@")
+        break
+        ;;
+      *)
+        AGENT_ARGS+=("$1")
+        shift
+        ;;
+    esac
+  done
+}
+
+expand_leading_tilde() {
+  local value="$1"
+  case "$value" in
+    "~")
+      printf '%s\n' "$HOME"
+      ;;
+    "~/"*)
+      printf '%s\n' "$HOME/${value#"~/"}"
+      ;;
+    *)
+      printf '%s\n' "$value"
+      ;;
+  esac
+}
+
+path_to_absolute() {
+  local path="$1"
+  path=$(expand_leading_tilde "$path")
+  case "$path" in
+    /*) printf '%s\n' "$path" ;;
+    .) printf '%s\n' "$PWD" ;;
+    ./*) printf '%s\n' "$PWD/${path#./}" ;;
+    *) printf '%s\n' "$PWD/$path" ;;
+  esac
+}
+
+path_relative_to_pwd() {
+  local path="$1"
+  local abs_pwd="${PWD%/}"
+  local abs_path
+  abs_path=$(path_to_absolute "$path")
+  if [[ "$abs_path" == "$abs_pwd" ]]; then
+    printf '.\n'
+  elif [[ "$abs_path" == "$abs_pwd/"* ]]; then
+    printf '%s\n' "${abs_path#"$abs_pwd"/}"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
+value_matches_glob_pattern() {
+  local prefix="$1"
+  local value="$2"
+  local remaining="$3"
+
+  if [[ "$remaining" == *'**/'* ]]; then
+    local before="${remaining%%'**/'*}"
+    local after="${remaining#*'**/'}"
+    value_matches_glob_pattern "${prefix}${before}**/" "$value" "$after" && return 0
+    value_matches_glob_pattern "${prefix}${before}" "$value" "$after" && return 0
+    return 1
+  fi
+
+  [[ "$value" == ${prefix}${remaining} ]]
+}
+
+path_matches_pattern() {
+  local path="$1"
+  local pattern="$2"
+  local abs_path rel_path basename
+  abs_path=$(path_to_absolute "$path")
+  rel_path=$(path_relative_to_pwd "$path")
+  basename=$(basename -- "$path")
+  value_matches_glob_pattern "" "$path" "$pattern" \
+    || value_matches_glob_pattern "" "$abs_path" "$pattern" \
+    || value_matches_glob_pattern "" "$rel_path" "$pattern" \
+    || value_matches_glob_pattern "" "$basename" "$pattern"
+}
+
+should_skip_path() {
+  local path="$1"
+  [[ "$(basename -- "$path")" == ".DS_Store" ]]
+}
+
+should_track_path() {
+  local path="$1"
+  local pattern
+
+  should_skip_path "$path" && return 1
+
+  if [[ ${#INCLUDE_PATTERNS[@]} -gt 0 ]]; then
+    local matched=false
+    for pattern in "${INCLUDE_PATTERNS[@]}"; do
+      if path_matches_pattern "$path" "$pattern"; then
+        matched=true
+        break
+      fi
+    done
+    [[ "$matched" == "true" ]] || return 1
+  fi
+
+  for pattern in "${IGNORE_PATTERNS[@]+"${IGNORE_PATTERNS[@]}"}"; do
+    if path_matches_pattern "$path" "$pattern"; then
+      return 1
+    fi
+  done
+
+  return 0
+}
+
+process_file_list() {
+  local source="$1"
+  local line path
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -n "$line" ]] || continue
+    path=$(expand_leading_tilde "$line")
+    if [[ ! -f "$path" ]]; then
+      log "skipping missing or non-regular file from $source: $line"
+      continue
+    fi
+    if ! should_track_path "$path"; then
+      log "skipping filtered file from $source: $path"
+      continue
+    fi
+    INPUT_FILES+=("$path")
+  done
+}
+
+collect_input_files() {
+  local source
+
+  if [[ ${#FILES_FROM[@]} -eq 0 ]]; then
+    if [[ -t 0 ]]; then
+      log_error "no file list provided. Use --files-from PATH or pipe newline-delimited paths on stdin."
+      exit 1
+    fi
+    FILES_FROM=("-")
+  fi
+
+  for source in "${FILES_FROM[@]}"; do
+    if [[ "$source" == "-" ]]; then
+      log "reading file list from stdin"
+      process_file_list "stdin"
+    else
+      [[ -f "$source" ]] || {
+        log_error "file list does not exist: $source"
+        exit 1
+      }
+      log "reading file list from $source"
+      process_file_list "$source" < "$source"
+    fi
+  done
+
+  [[ ${#INPUT_FILES[@]} -gt 0 ]] || {
+    log_error "no matching files found in the provided file list."
+    exit 1
+  }
+}
+
+validate_config() {
+  [[ "$MAX_FILES" =~ ^[0-9]+$ ]] || {
+    log_error "max-files must be a non-negative integer."
+    exit 1
+  }
+}
+
+setup_transcript_file() {
+  [[ -n "$COMPLETION_PROMISE" ]] || return 0
+  TRANSCRIPT_FILE="$(mktemp "${TMPDIR:-/tmp}/${WRAPPER_NAME}.XXXXXX")"
+}
+
+cleanup() {
+  local exit_code=$?
+  [[ -n "$TRANSCRIPT_FILE" ]] && rm -f "$TRANSCRIPT_FILE"
+  exit "$exit_code"
+}
+
+transcript_contains_promise() {
+  [[ -n "$COMPLETION_PROMISE" ]] || return 1
+  [[ -n "$TRANSCRIPT_FILE" && -f "$TRANSCRIPT_FILE" ]] || return 1
+
+  if LC_ALL=C grep -aFq -- "$COMPLETION_PROMISE" "$TRANSCRIPT_FILE"; then
+    return 0
+  fi
+
+  if command -v strings >/dev/null 2>&1; then
+    if LC_ALL=C strings -a -n 1 "$TRANSCRIPT_FILE" | grep -Fq -- "$COMPLETION_PROMISE"; then
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+expand_template() {
+  local current_file="$1"
+  EXPANDED_ARGS=()
+  for arg in "${AGENT_ARGS[@]}"; do
+    arg="${arg//\{\{files\}\}/$current_file}"
+    arg="${arg//\{\{file\}\}/$current_file}"
+    EXPANDED_ARGS+=("$arg")
+  done
+}
+
+run_agent_once() {
+  local -a args=("$@")
+
+  if [[ -n "$TRANSCRIPT_FILE" ]]; then
+    : > "$TRANSCRIPT_FILE"
+  fi
+
+  set +e
+  if [[ -n "$COMPLETION_PROMISE" ]]; then
+    if [[ -t 0 && -t 1 ]]; then
+      script -q "$TRANSCRIPT_FILE" "$AGENT_BIN" "${args[@]}"
+      LAST_EXIT_CODE=$?
+    else
+      "$AGENT_BIN" "${args[@]}" 2>&1 | tee "$TRANSCRIPT_FILE"
+      LAST_EXIT_CODE=${PIPESTATUS[0]}
+    fi
+  else
+    "$AGENT_BIN" "${args[@]}"
+    LAST_EXIT_CODE=$?
+  fi
+  set -e
+
+  log "$AGENT_BIN exited with code $LAST_EXIT_CODE"
+}
+
+eval_run_result() {
+  case "$LAST_EXIT_CODE" in
+    0)
+      ;;
+    129|130|137|143)
+      log "interrupted by signal while processing $CURRENT_FILE"
+      WRAPPER_EXIT_CODE=$LAST_EXIT_CODE
+      return 1
+      ;;
+    *)
+      FAILED_RUNS=$((FAILED_RUNS + 1))
+      log "non-zero exit code while processing $CURRENT_FILE: $LAST_EXIT_CODE"
+      ;;
+  esac
+
+  if transcript_contains_promise; then
+    log "completion promise matched after file $PROCESSED_COUNT"
+    if [[ "$FAILED_RUNS" -gt 0 ]]; then
+      WRAPPER_EXIT_CODE=1
+    else
+      WRAPPER_EXIT_CODE=0
+    fi
+    return 1
+  fi
+
+  return 0
+}
+
+main() {
+  parse_args "$@"
+  validate_config
+  check_dependencies
+  collect_input_files
+  setup_transcript_file
+  trap cleanup EXIT INT TERM
+
+  if [[ ${#AGENT_ARGS[@]} -eq 0 ]]; then
+    log_error "no arguments provided for cursor-agent. See --help for usage."
+    exit 1
+  fi
+
+  log "files=${#INPUT_FILES[@]} include_patterns=${INCLUDE_PATTERNS[*]:-<none>} exclude_patterns=${IGNORE_PATTERNS[*]:-<none>} max_files=$MAX_FILES completion_promise=${COMPLETION_PROMISE:-<none>}"
+
+  WRAPPER_EXIT_CODE=0
+
+  for CURRENT_FILE in "${INPUT_FILES[@]}"; do
+    if [[ "$MAX_FILES" -gt 0 ]] && [[ "$PROCESSED_COUNT" -ge "$MAX_FILES" ]]; then
+      log "maximum files reached: $MAX_FILES"
+      break
+    fi
+
+    PROCESSED_COUNT=$((PROCESSED_COUNT + 1))
+    log "processing file $PROCESSED_COUNT/${#INPUT_FILES[@]}: $CURRENT_FILE"
+    expand_template "$CURRENT_FILE"
+    run_agent_once "${EXPANDED_ARGS[@]}"
+    if ! eval_run_result; then
+      return "$WRAPPER_EXIT_CODE"
+    fi
+  done
+
+  if [[ "$FAILED_RUNS" -gt 0 ]]; then
+    return 1
+  fi
+}
+
+main "$@"

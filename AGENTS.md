@@ -1,6 +1,6 @@
 # agent-loop
 
-Bash scripts to run CLI-based AI agents (Claude Code, Codex CLI, Gemini CLI, Copilot CLI, OpenCode, etc.) in an automated loop.
+Bash scripts to run CLI-based AI agents (Claude Code, Codex CLI, Gemini CLI, Copilot CLI, OpenCode, etc.) in automated loops, watches, and file-list batches.
 
 ## Design philosophy
 
@@ -25,6 +25,13 @@ Each iteration starts as a brand-new session. The agent picks up previous work t
 - `cursor-loop` — Standalone loop wrapper for Cursor Agent CLI using plain process restarts
 - `opencode-loop` — Standalone loop wrapper for OpenCode CLI using plain process restarts
 - `cline-loop` — Standalone loop wrapper for Cline CLI using plain process restarts
+- `claude-files` — File-list wrapper for Claude Code using Stop hooks
+- `codex-files` — Standalone file-list wrapper for Codex CLI using plain process restarts
+- `gemini-files` — File-list wrapper for Gemini CLI using AfterAgent hooks
+- `copilot-files` — File-list wrapper for GitHub Copilot CLI using agentStop hooks
+- `cursor-files` — Standalone file-list wrapper for Cursor Agent CLI using plain process restarts
+- `opencode-files` — Standalone file-list wrapper for OpenCode CLI using plain process restarts
+- `cline-files` — Standalone file-list wrapper for Cline CLI using plain process restarts
 - `claude-watch` — File-change trigger wrapper for Claude Code using Stop hooks
 - `codex-watch` — Standalone file-change trigger wrapper for Codex CLI
 - `gemini-watch` — File-change trigger wrapper for Gemini CLI using AfterAgent hooks
@@ -51,7 +58,7 @@ Every wrapper other than `claude-loop` should be implemented as a standalone scr
 
 ## Development guidelines
 
-- Add each agent CLI loop as a separate top-level file
+- Add each agent CLI wrapper as a separate top-level file
 - Write scripts in bash with minimal external dependencies
 - Keep runtime behavior self-contained inside each script
 - Always backup and restore existing settings files when a wrapper edits them
