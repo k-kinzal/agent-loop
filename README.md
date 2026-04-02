@@ -184,6 +184,8 @@ All `*-files` wrappers support:
 - Depends on `jq`
 - Uses a project-local Copilot `agentStop` hook under `.github/hooks/`
 - Reads Copilot's session transcript to match the completion promise
+- Accepts a single positional prompt and runs it as `copilot -i` when no
+  explicit Copilot mode or subcommand is provided
 - Works for prompt mode and interactive sessions by terminating Copilot after
   each completed agent turn
 
@@ -192,6 +194,8 @@ All `*-files` wrappers support:
 - Depends on `copilot` and `jq`
 - Reads newline-delimited file lists from `--files-from` or stdin
 - Uses a project-local Copilot `agentStop` hook under `.github/hooks/`
+- Accepts a single positional prompt and runs it as `copilot -i` when no
+  explicit Copilot mode or subcommand is provided
 - Terminates Copilot after each file so the wrapper can move to the next entry
 
 ### `cursor-loop`
@@ -246,6 +250,8 @@ All `*-files` wrappers support:
 - Supports `--include`/`--exclude` glob filters and can derive watch roots from
   `--include` when `--watch-dir` is omitted
 - Uses a project-local Copilot `agentStop` hook under `.github/hooks/`
+- Accepts a single positional prompt and runs it as `copilot -i` when no
+  explicit Copilot mode or subcommand is provided
 - Terminates Copilot after each trigger via SIGTERM
 
 ### `cursor-watch`

@@ -20,15 +20,17 @@
 #         Stop when TEXT appears in Copilot's final response
 #
 #     --debug
-#         Enable copilot-loop debug logging
+#         Enable debug logging for both copilot-loop and copilot
 #
 #     --help, -h
 #         Show this help message
 #
-#     All other options are passed through to copilot.
+#     All other options are passed through to copilot. If no explicit copilot
+#     mode or subcommand is provided, a single positional prompt is treated as
+#     `copilot -i "<prompt>"`.
 #
 # EXAMPLES
-#     copilot-loop --max-iteration 5 -- -p "implement feature X"
+#     copilot-loop --max-iteration 5 "implement feature X"
 #     copilot-loop --completion-promise "DONE" -- -i "work until done"
 #     copilot-loop --max-iteration 3
 #
@@ -44,6 +46,8 @@ readonly HOOKS_DIR="${GITHUB_DIR}/hooks"
 readonly STATE_FILE="${GITHUB_DIR}/copilot-loop.state.json"
 readonly HOOK_SCRIPT_PATH="${HOOKS_DIR}/copilot-loop-hook.sh"
 readonly HOOK_CONFIG_PATH="${HOOKS_DIR}/copilot-loop.json"
+readonly HOOK_SCRIPT_BACKUP="${HOOK_SCRIPT_PATH}.copilot-loop-backup"
+readonly HOOK_CONFIG_BACKUP="${HOOK_CONFIG_PATH}.copilot-loop-backup"
 readonly HOOK_LOG_FILE="${GITHUB_DIR}/copilot-loop-hook.log"
 
 ITERATION=1
@@ -54,6 +58,110 @@ DEBUG=false
 
 log() { [[ "$DEBUG" == "true" ]] && echo "[copilot-loop] $1" >&2 || true; }
 log_error() { echo "[copilot-loop] ERROR: $1" >&2; }
+
+copilot_option_takes_value() {
+  case "$1" in
+    --add-dir|--add-github-mcp-tool|--add-github-mcp-toolset|--additional-mcp-config|--agent|--config-dir|--disable-mcp-server|--effort|--interactive|--log-dir|--log-level|--max-autopilot-continues|--model|--output-format|--plugin-dir|--prompt|--reasoning-effort|--stream)
+      return 0
+      ;;
+    --allow-tool|--allow-url|--alt-screen|--available-tools|--bash-env|--deny-tool|--deny-url|--excluded-tools|--mouse|--resume|--secret-env-vars|--share)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+copilot_has_explicit_mode_or_command() {
+  local i arg
+  for ((i=0; i<${#COPILOT_ARGS[@]}; i++)); do
+    arg="${COPILOT_ARGS[$i]}"
+    case "$arg" in
+      -p|--prompt|-i|--interactive|--continue|--resume|--resume=*|--acp|--help|-h|-v|--version)
+        return 0
+        ;;
+    esac
+    if copilot_option_takes_value "$arg"; then
+      ((i++))
+      continue
+    fi
+    if [[ "$arg" != -* ]]; then
+      case "$arg" in
+        help|init|login|plugin|update|version)
+          return 0
+          ;;
+      esac
+      break
+    fi
+  done
+  return 1
+}
+
+find_implicit_prompt_index() {
+  local i arg prompt_index=""
+  for ((i=0; i<${#COPILOT_ARGS[@]}; i++)); do
+    arg="${COPILOT_ARGS[$i]}"
+    case "$arg" in
+      -p|--prompt|-i|--interactive|--continue|--resume|--resume=*|--acp|--help|-h|-v|--version)
+        return 1
+        ;;
+    esac
+    if copilot_option_takes_value "$arg"; then
+      ((i++))
+      continue
+    fi
+    if [[ "$arg" != -* ]]; then
+      case "$arg" in
+        help|init|login|plugin|update|version)
+          return 1
+          ;;
+      esac
+      if [[ -n "$prompt_index" ]]; then
+        return 1
+      fi
+      prompt_index="$i"
+    fi
+  done
+  [[ -n "$prompt_index" ]] || return 1
+  printf '%s\n' "$prompt_index"
+}
+
+prepare_copilot_args() {
+  local arg i prompt_index prompt_value
+  local has_log_level=false
+  local prepared_args=()
+
+  if [[ "$DEBUG" == "true" ]]; then
+    for arg in "${COPILOT_ARGS[@]}"; do
+      case "$arg" in
+        --log-level|--log-level=*)
+          has_log_level=true
+          break
+          ;;
+      esac
+    done
+    if [[ "$has_log_level" != "true" ]]; then
+      COPILOT_ARGS=(--log-level debug "${COPILOT_ARGS[@]}")
+    fi
+  fi
+
+  if copilot_has_explicit_mode_or_command; then
+    return
+  fi
+
+  prompt_index=$(find_implicit_prompt_index || true)
+  [[ -n "$prompt_index" ]] || return
+
+  prompt_value="${COPILOT_ARGS[$prompt_index]}"
+  for ((i=0; i<${#COPILOT_ARGS[@]}; i++)); do
+    if [[ "$i" -eq "$prompt_index" ]]; then
+      prepared_args+=(-i "$prompt_value")
+    else
+      prepared_args+=("${COPILOT_ARGS[$i]}")
+    fi
+  done
+  COPILOT_ARGS=("${prepared_args[@]}")
+  log "inferred interactive prompt mode from positional prompt"
+}
 
 check_dependencies() {
   command -v jq >/dev/null 2>&1 || { log_error "jq is required but not installed."; exit 1; }
@@ -71,6 +179,26 @@ parse_args() {
       *)                    COPILOT_ARGS+=("$1"); shift ;;
     esac
   done
+}
+
+backup_hook_files() {
+  rm -f "$HOOK_SCRIPT_BACKUP" "$HOOK_CONFIG_BACKUP"
+  if [[ -f "$HOOK_SCRIPT_PATH" ]]; then
+    cp "$HOOK_SCRIPT_PATH" "$HOOK_SCRIPT_BACKUP"
+  fi
+  if [[ -f "$HOOK_CONFIG_PATH" ]]; then
+    cp "$HOOK_CONFIG_PATH" "$HOOK_CONFIG_BACKUP"
+  fi
+}
+
+restore_hook_file() {
+  local path="$1"
+  local backup="$2"
+  if [[ -f "$backup" ]]; then
+    mv "$backup" "$path"
+  else
+    rm -f "$path"
+  fi
 }
 
 write_state() {
@@ -109,6 +237,7 @@ read_stop_reason() {
 
 create_hook_script() {
   mkdir -p "$HOOKS_DIR"
+  backup_hook_files
   cat > "$HOOK_SCRIPT_PATH" << 'HOOKEOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -174,7 +303,6 @@ debug_log "sending SIGTERM to parent/copilot processes parent=${PARENT_PID:-<non
 [[ -n "$PARENT_PID" ]] && kill -TERM "$PARENT_PID" 2>/dev/null || true
 [[ -n "$GRANDPARENT_PID" ]] && kill -TERM "$GRANDPARENT_PID" 2>/dev/null || true
 
-printf '%s\n' '{"decision":"allow"}'
 exit 0
 HOOKEOF
 
@@ -200,11 +328,14 @@ EOF
 
 cleanup() {
   local exit_code=$?
-  rm -f "$HOOK_SCRIPT_PATH"
-  rm -f "$HOOK_CONFIG_PATH"
+  trap - EXIT INT TERM
+  restore_hook_file "$HOOK_SCRIPT_PATH" "$HOOK_SCRIPT_BACKUP"
+  restore_hook_file "$HOOK_CONFIG_PATH" "$HOOK_CONFIG_BACKUP"
   rm -f "${GITHUB_DIR}/copilot-loop.debug"
+  rm -f "$HOOK_LOG_FILE"
   rmdir "$HOOKS_DIR" 2>/dev/null || true
   rm -f "$STATE_FILE"
+  rmdir "$GITHUB_DIR" 2>/dev/null || true
   exit "$exit_code"
 }
 
@@ -223,6 +354,7 @@ show_usage() {
 main() {
   check_dependencies
   parse_args "$@"
+  prepare_copilot_args
 
   [[ "$MAX_ITERATIONS" =~ ^[0-9]+$ ]] || {
     log_error "max iteration must be a non-negative integer."
