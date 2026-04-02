@@ -1,28 +1,24 @@
 #!/usr/bin/env bash
 #
-# codex-loop - Run Codex CLI in a managed restart loop
+# codex-loop - Run Codex CLI in a managed Stop-hook loop
 #
 # USAGE
 #     codex-loop [LOOP_OPTIONS] [--] [CODEX_ARGS...]
 #
 # DESCRIPTION
-#     Launches Codex as a fresh process on each iteration. When Codex exits
-#     successfully, codex-loop decides whether to stop or start a new Codex
-#     process.
-#
-#     Interactive Codex sessions are supported, but the loop can only continue
-#     after Codex exits. For autonomous looping, prefer non-interactive modes
-#     such as `codex exec ...`.
+#     Runs Codex under a managed Stop hook until a termination condition is
+#     met. The hook records each turn boundary and terminates the current Codex
+#     process so codex-loop can restart Codex as a fresh process on the next
+#     iteration.
 #
 # LOOP OPTIONS
 #     --max-iteration N
 #     --loop-max-iteration N
-#         Stop after N successful iterations. Default: 0 (unlimited)
+#         Stop after N iterations. Default: 0 (unlimited)
 #
 #     --completion-promise TEXT
 #     --loop-completion-promise TEXT
-#         Stop when TEXT appears in Codex output
-#         Note: promise matching is best-effort for full-screen TUI sessions
+#         Stop when TEXT appears in Codex's latest assistant message
 #
 #     --debug
 #     --loop-debug
@@ -35,15 +31,15 @@
 #     otherwise be interpreted by codex-loop, place it after `--`.
 #
 # EXAMPLES
+#     codex-loop --max-iteration 5 "implement feature X"
+#     codex-loop --completion-promise "DONE" "work until done"
 #     codex-loop --max-iteration 5 -- exec --full-auto "implement feature X"
-#     codex-loop --completion-promise "DONE" -- exec "work until done"
-#     codex-loop --max-iteration 1
 #     codex-loop -- --help
 #
 # DEPENDENCIES
 #     - bash
 #     - codex
-#     - script (only needed for interactive completion-promise capture)
+#     - jq
 #
 
 set -euo pipefail
@@ -58,7 +54,16 @@ MAX_ITERATIONS=0
 COMPLETION_PROMISE=""
 DEBUG=false
 AGENT_ARGS=()
-TRANSCRIPT_FILE=""
+PROJECT_DIR=""
+CODEX_DIR=""
+HOOKS_DIR=""
+STATE_FILE=""
+HOOKS_FILE=""
+HOOKS_FILE_BACKUP=""
+HOOK_SCRIPT_PATH=""
+DEBUG_FLAG_FILE=""
+HOOK_LOG_FILE=""
+HOOKS_MODIFIED=false
 
 log() {
   [[ "$DEBUG" == "true" ]] && printf '[%s] %s\n' "$WRAPPER_NAME" "$1" >&2 || true
@@ -86,12 +91,10 @@ check_dependencies() {
     exit 1
   }
 
-  if [[ -n "$COMPLETION_PROMISE" ]] && [[ -t 0 && -t 1 ]]; then
-    command -v script >/dev/null 2>&1 || {
-      log_error "script is required for interactive completion-promise capture."
-      exit 1
-    }
-  fi
+  command -v jq >/dev/null 2>&1 || {
+    log_error "jq is required but not installed."
+    exit 1
+  }
 }
 
 parse_args() {
@@ -141,105 +144,331 @@ validate_config() {
   }
 }
 
-setup_transcript_file() {
-  [[ -n "$COMPLETION_PROMISE" ]] || return 0
-  TRANSCRIPT_FILE="$(mktemp "${TMPDIR:-/tmp}/${WRAPPER_NAME}.XXXXXX")"
+path_to_absolute() {
+  local path="$1"
+
+  case "$path" in
+    "~")
+      path="$HOME"
+      ;;
+    "~/"*)
+      path="$HOME/${path#"~/"}"
+      ;;
+  esac
+
+  case "$path" in
+    /*)
+      printf '%s\n' "$path"
+      ;;
+    .)
+      printf '%s\n' "$PWD"
+      ;;
+    ./*)
+      printf '%s\n' "$PWD/${path#./}"
+      ;;
+    *)
+      printf '%s\n' "$PWD/$path"
+      ;;
+  esac
+}
+
+resolve_project_dir() {
+  local candidate="$PWD"
+  local i arg
+
+  for ((i = 0; i < ${#AGENT_ARGS[@]}; i++)); do
+    arg="${AGENT_ARGS[$i]}"
+    case "$arg" in
+      -C|--cd)
+        if (( i + 1 < ${#AGENT_ARGS[@]} )); then
+          candidate="${AGENT_ARGS[$((i + 1))]}"
+        fi
+        ;;
+      --cd=*)
+        candidate="${arg#--cd=}"
+        ;;
+    esac
+  done
+
+  candidate=$(path_to_absolute "$candidate")
+  PROJECT_DIR=$(cd "$candidate" 2>/dev/null && pwd) || {
+    log_error "cannot access codex working directory: $candidate"
+    exit 1
+  }
+}
+
+initialize_paths() {
+  CODEX_DIR="${PROJECT_DIR}/.codex"
+  HOOKS_DIR="${CODEX_DIR}/hooks"
+  STATE_FILE="${CODEX_DIR}/codex-loop.state.json"
+  HOOKS_FILE="${CODEX_DIR}/hooks.json"
+  HOOKS_FILE_BACKUP="${HOOKS_FILE}.codex-loop-backup"
+  HOOK_SCRIPT_PATH="${HOOKS_DIR}/codex-loop-hook.sh"
+  DEBUG_FLAG_FILE="${CODEX_DIR}/codex-loop.debug"
+  HOOK_LOG_FILE="${CODEX_DIR}/codex-loop-hook.log"
+}
+
+write_state() {
+  local decision="${1:-null}"
+  local hook_called="${2:-false}"
+  local stop_reason="${3:-}"
+
+  mkdir -p "$CODEX_DIR"
+  cat > "$STATE_FILE" << EOF
+{
+  "active": true,
+  "iteration": $ITERATION,
+  "max_iterations": $MAX_ITERATIONS,
+  "completion_promise": $(printf '%s' "$COMPLETION_PROMISE" | jq -Rs .),
+  "decision": $(if [[ "$decision" == "null" ]]; then echo "null"; else printf '"%s"' "$decision"; fi),
+  "hook_called": $hook_called,
+  "stop_reason": $(printf '%s' "$stop_reason" | jq -Rs .)
+}
+EOF
+}
+
+read_decision() {
+  [[ -f "$STATE_FILE" ]] && jq -r '.decision // "null"' "$STATE_FILE" || echo "null"
+}
+
+read_iteration() {
+  [[ -f "$STATE_FILE" ]] && jq -r '.iteration // 1' "$STATE_FILE" || echo "1"
+}
+
+read_hook_called() {
+  [[ -f "$STATE_FILE" ]] && jq -r '.hook_called // false' "$STATE_FILE" || echo "false"
+}
+
+read_stop_reason() {
+  [[ -f "$STATE_FILE" ]] && jq -r '.stop_reason // ""' "$STATE_FILE" || echo ""
+}
+
+create_hook_script() {
+  mkdir -p "$HOOKS_DIR"
+  cat > "$HOOK_SCRIPT_PATH" << 'HOOKEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+CODEX_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+STATE_FILE="${CODEX_DIR}/codex-loop.state.json"
+DEBUG_FLAG_FILE="${CODEX_DIR}/codex-loop.debug"
+HOOK_LOG_FILE="${CODEX_DIR}/codex-loop-hook.log"
+
+debug_log() {
+  [[ -f "$DEBUG_FLAG_FILE" ]] || return 0
+  mkdir -p "$(dirname "$HOOK_LOG_FILE")"
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$HOOK_LOG_FILE"
+}
+
+INPUT=$(cat)
+
+[[ ! -f "$STATE_FILE" ]] && exit 0
+
+STATE=$(cat "$STATE_FILE")
+[[ $(echo "$STATE" | jq -r '.active // false') != "true" ]] && exit 0
+
+TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path // empty')
+ITERATION=$(echo "$STATE" | jq -r '.iteration // 1')
+MAX_ITERATIONS=$(echo "$STATE" | jq -r '.max_iterations // 0')
+COMPLETION_PROMISE=$(echo "$STATE" | jq -r '.completion_promise // ""')
+LAST_ASSISTANT_MESSAGE=$(echo "$INPUT" | jq -r '.last_assistant_message // empty')
+STOP_HOOK_ACTIVE=$(echo "$INPUT" | jq -r '.stop_hook_active // false')
+ASSISTANT_TEXT="$LAST_ASSISTANT_MESSAGE"
+
+debug_log "Stop hook started: iteration=$ITERATION max_iterations=$MAX_ITERATIONS stop_hook_active=$STOP_HOOK_ACTIVE transcript_path=${TRANSCRIPT_PATH:-<none>}"
+
+if [[ -z "$ASSISTANT_TEXT" ]] && [[ -n "$TRANSCRIPT_PATH" ]] && [[ -f "$TRANSCRIPT_PATH" ]]; then
+  ASSISTANT_TEXT=$(jq -r '
+    select(.type == "assistant")
+    | .message.content[]?
+    | select(.type == "text")
+    | .text // empty
+  ' "$TRANSCRIPT_PATH" 2>/dev/null | tail -n 1 || true)
+fi
+
+DECISION=""
+STOP_REASON=""
+
+if [[ -n "$COMPLETION_PROMISE" ]] && [[ -n "$ASSISTANT_TEXT" ]] && grep -qF -- "$COMPLETION_PROMISE" <<< "$ASSISTANT_TEXT"; then
+  DECISION="complete"
+  STOP_REASON="Completion promise matched."
+  debug_log "decision=complete iteration=$ITERATION"
+elif [[ "$MAX_ITERATIONS" -gt 0 ]] && [[ "$ITERATION" -ge "$MAX_ITERATIONS" ]]; then
+  DECISION="max_reached"
+  STOP_REASON="Maximum iterations reached."
+  debug_log "decision=max_reached iteration=$ITERATION/$MAX_ITERATIONS"
+else
+  DECISION="continue"
+  NEW_ITERATION=$((ITERATION + 1))
+  debug_log "decision=continue iteration=$ITERATION->$NEW_ITERATION"
+fi
+
+if [[ "$DECISION" == "continue" ]]; then
+  jq --argjson iter "$NEW_ITERATION" \
+     '.iteration = $iter | .decision = "continue" | .hook_called = true | .stop_reason = ""' \
+     "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+else
+  jq --arg decision "$DECISION" --arg reason "$STOP_REASON" \
+     '.decision = $decision | .hook_called = true | .stop_reason = $reason' \
+     "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+fi
+
+if [[ -n "$STOP_REASON" ]]; then
+  jq -cn --arg reason "$STOP_REASON" '{"continue": false, "stopReason": $reason}'
+else
+  jq -cn '{"continue": false}'
+fi
+
+debug_log "sending SIGTERM to codex process (PID=$PPID)"
+kill -TERM "$PPID" 2>/dev/null || true
+exit 0
+HOOKEOF
+
+  chmod +x "$HOOK_SCRIPT_PATH"
+  if [[ "$DEBUG" == "true" ]]; then
+    touch "$DEBUG_FLAG_FILE"
+  fi
+}
+
+merge_hooks_file() {
+  local tmp_file
+
+  mkdir -p "$CODEX_DIR"
+
+  if [[ -f "$HOOKS_FILE" ]]; then
+    cp "$HOOKS_FILE" "$HOOKS_FILE_BACKUP"
+  fi
+
+  if [[ -f "$HOOKS_FILE" ]]; then
+    tmp_file=$(mktemp "${TMPDIR:-/tmp}/${WRAPPER_NAME}.hooks.XXXXXX")
+    jq --arg cmd "$HOOK_SCRIPT_PATH" '
+      .hooks = (.hooks // {})
+      | .hooks.Stop = (
+          ((.hooks.Stop // [])
+            | map(
+                .hooks = ((.hooks // []) | map(select(.command != $cmd)))
+              )
+            | map(select((.hooks | length) > 0))
+          )
+          + [{"hooks": [{"type": "command", "command": $cmd, "timeout": 30}]}]
+        )
+    ' "$HOOKS_FILE" > "$tmp_file"
+    mv "$tmp_file" "$HOOKS_FILE"
+  else
+    jq -n --arg cmd "$HOOK_SCRIPT_PATH" '
+      {
+        hooks: {
+          Stop: [
+            {
+              hooks: [
+                {
+                  type: "command",
+                  command: $cmd,
+                  timeout: 30
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ' > "$HOOKS_FILE"
+  fi
+
+  HOOKS_MODIFIED=true
+  log "hook registered in $HOOKS_FILE"
+}
+
+restore_hooks_file() {
+  [[ "$HOOKS_MODIFIED" == "true" ]] || return 0
+
+  if [[ -f "$HOOKS_FILE_BACKUP" ]]; then
+    mv "$HOOKS_FILE_BACKUP" "$HOOKS_FILE"
+  else
+    rm -f "$HOOKS_FILE"
+  fi
+
+  HOOKS_MODIFIED=false
 }
 
 cleanup() {
   local exit_code=$?
-  [[ -n "$TRANSCRIPT_FILE" ]] && rm -f "$TRANSCRIPT_FILE"
+
+  rm -f "$HOOK_SCRIPT_PATH"
+  rm -f "$DEBUG_FLAG_FILE"
+  rm -f "$HOOK_LOG_FILE"
+  restore_hooks_file
+  rm -f "$STATE_FILE"
+  rmdir "$HOOKS_DIR" 2>/dev/null || true
+  rmdir "$CODEX_DIR" 2>/dev/null || true
   exit "$exit_code"
-}
-
-transcript_contains_promise() {
-  [[ -n "$COMPLETION_PROMISE" ]] || return 1
-  [[ -n "$TRANSCRIPT_FILE" && -f "$TRANSCRIPT_FILE" ]] || return 1
-
-  if LC_ALL=C grep -aFq -- "$COMPLETION_PROMISE" "$TRANSCRIPT_FILE"; then
-    return 0
-  fi
-
-  if command -v strings >/dev/null 2>&1; then
-    if LC_ALL=C strings -a -n 1 "$TRANSCRIPT_FILE" | grep -Fq -- "$COMPLETION_PROMISE"; then
-      return 0
-    fi
-  fi
-
-  return 1
-}
-
-run_agent_once() {
-  local exit_code
-
-  if [[ -n "$TRANSCRIPT_FILE" ]]; then
-    : > "$TRANSCRIPT_FILE"
-  fi
-
-  log "starting $AGENT_BIN (iteration $ITERATION)"
-
-  set +e
-  if [[ -n "$COMPLETION_PROMISE" ]]; then
-    if [[ -t 0 && -t 1 ]]; then
-      script -q "$TRANSCRIPT_FILE" "$AGENT_BIN" "${AGENT_ARGS[@]}"
-      exit_code=$?
-    else
-      "$AGENT_BIN" "${AGENT_ARGS[@]}" 2>&1 | tee "$TRANSCRIPT_FILE"
-      exit_code=${PIPESTATUS[0]}
-    fi
-  else
-    "$AGENT_BIN" "${AGENT_ARGS[@]}"
-    exit_code=$?
-  fi
-  set -e
-
-  log "$AGENT_BIN exited with code $exit_code"
-  return "$exit_code"
 }
 
 main() {
   parse_args "$@"
   validate_config
   check_dependencies
-  setup_transcript_file
+  resolve_project_dir
+  initialize_paths
   trap cleanup EXIT INT TERM
 
-  if [[ "$MAX_ITERATIONS" -eq 0 ]] && [[ -z "$COMPLETION_PROMISE" ]]; then
-    log "no termination condition configured; the loop will continue until interrupted."
-  fi
+  log "project_dir=$PROJECT_DIR max_iterations=$MAX_ITERATIONS completion_promise=${COMPLETION_PROMISE:-<none>}"
+
+  create_hook_script
+  merge_hooks_file
 
   while true; do
-    local exit_code
+    local codex_exit_code decision hook_called stop_reason
+    local run_args=(-c "features.codex_hooks=true" "${AGENT_ARGS[@]}")
+
+    write_state "null" "false"
+    log "starting $AGENT_BIN (iteration $ITERATION)"
+
     set +e
-    run_agent_once
-    exit_code=$?
+    "$AGENT_BIN" "${run_args[@]}"
+    codex_exit_code=$?
     set -e
 
-    case "$exit_code" in
-      0)
+    decision=$(read_decision)
+    hook_called=$(read_hook_called)
+    ITERATION=$(read_iteration)
+    stop_reason=$(read_stop_reason)
+
+    log "$AGENT_BIN exited (code=$codex_exit_code, decision=$decision, hook=$hook_called, reason=${stop_reason:-<none>})"
+
+    if [[ "$hook_called" != "true" ]]; then
+      log "hook not called; exiting with codex's status"
+      return "$codex_exit_code"
+    fi
+
+    case "$decision" in
+      complete|max_reached)
+        case "$codex_exit_code" in
+          0|129|130|137|143)
+            ;;
+          *)
+            log "unexpected non-zero exit for terminal decision: $codex_exit_code"
+            return "$codex_exit_code"
+            ;;
+        esac
+        log "finished after $ITERATION iteration(s): ${stop_reason:-<none>}"
+        return 0
         ;;
-      129|130|137|143)
-        log "terminating on signal-like exit code: $exit_code"
-        return "$exit_code"
+      continue)
+        case "$codex_exit_code" in
+          0|129|130|137|143)
+            ;;
+          *)
+            log "unexpected non-zero exit while continuing: $codex_exit_code"
+            return "$codex_exit_code"
+            ;;
+        esac
+        log "iteration $((ITERATION - 1)) complete, restarting $AGENT_BIN"
         ;;
       *)
-        log "terminating on non-zero exit code: $exit_code"
-        return "$exit_code"
+        log_error "unexpected decision: $decision"
+        return 1
         ;;
     esac
-
-    if transcript_contains_promise; then
-      log "completion promise matched after iteration $ITERATION"
-      return 0
-    fi
-
-    if [[ "$MAX_ITERATIONS" -gt 0 ]] && [[ "$ITERATION" -ge "$MAX_ITERATIONS" ]]; then
-      log "maximum iterations reached: $ITERATION"
-      return 0
-    fi
-
-    ITERATION=$((ITERATION + 1))
-    log "restarting $AGENT_BIN"
   done
 }
 

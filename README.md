@@ -16,7 +16,7 @@ wrapper, not the agent, responsible for loop control.
 ## Included tools
 
 - `claude-loop`: Claude Code wrapper using Claude Stop hooks
-- `codex-loop`: Codex CLI wrapper for iterative process restarts
+- `codex-loop`: Codex CLI wrapper using project-local Codex Stop hooks
 - `gemini-loop`: Gemini CLI wrapper for iterative process restarts
 - `copilot-loop`: GitHub Copilot CLI wrapper for iterative process restarts
 - `cursor-loop`: Cursor Agent CLI wrapper for iterative process restarts
@@ -70,9 +70,9 @@ All wrappers follow the same high-level model:
 3. Stop if the maximum iteration count or completion promise was reached.
 4. Otherwise start a new process for the next iteration.
 
-This means interactive/TUI modes only advance the loop after the underlying CLI
-exits. If the upstream CLI keeps an interactive session open indefinitely, the
-wrapper cannot force a new iteration until that session ends.
+Wrappers that use agent-specific stop hooks can actively end a turn and return
+control to the wrapper. Plain restart wrappers still depend on the upstream CLI
+exiting on its own before the next iteration can begin.
 
 ## Wrapper options
 
@@ -138,18 +138,29 @@ All `*-files` wrappers support:
 
 ### `codex-loop`
 
-- Depends on `codex`
-- Uses plain process restarts rather than Codex-specific hooks
-- Interactive Codex sessions launch correctly, but reliable autonomous looping
-  requires a Codex mode that exits on completion, such as `codex exec`
+- Depends on `codex` and `jq`
+- Uses a project-local Codex `Stop` hook under `.codex/hooks.json`
+- Terminates Codex after each completed turn so both interactive and `exec`
+  sessions can restart as fresh processes
+- Enables the experimental `codex_hooks` feature for the wrapped Codex run and
+  restores any prior project-local hooks file on exit
 
-### `codex-files` / `cursor-files` / `opencode-files` / `cline-files`
+### `codex-files`
+
+- Depends on `codex` and `jq`
+- Reads newline-delimited file lists from `--files-from` or stdin
+- Uses a project-local Codex `Stop` hook under `.codex/hooks.json`
+- Terminates Codex after each file so the wrapper can move to the next entry
+- Enables the experimental `codex_hooks` feature for the wrapped Codex run and
+  restores any prior project-local hooks file on exit
+
+### `cursor-files` / `opencode-files` / `cline-files`
 
 - Read newline-delimited file lists from `--files-from` or stdin
 - Start a fresh process per file and support `--include`/`--exclude`,
   `--max-files`, and `{{file}}` templates
-- Reliable autonomous batching is best with `codex exec ...`,
-  `cursor-agent --print ...`, `opencode run ...`, and `cline --oneshot ...`
+- Reliable autonomous batching is best with `cursor-agent --print ...`,
+  `opencode run ...`, and `cline --oneshot ...`
 
 ### `gemini-loop`
 
@@ -210,11 +221,15 @@ All `*-files` wrappers support:
 
 ### `codex-watch`
 
-- Depends on `codex` and optionally `fswatch`
+- Depends on `codex`, `jq`, and optionally `fswatch`
 - Watches directories for file changes, then runs Codex CLI
 - Supports `--include`/`--exclude` glob filters and can derive watch roots from
   `--include` when `--watch-dir` is omitted
-- Reliable autonomous watching requires `codex exec ...`
+- Uses a project-local Codex `Stop` hook under `.codex/hooks.json`
+- Terminates Codex after each completed trigger so both interactive and `exec`
+  sessions can return control to the watcher
+- Enables the experimental `codex_hooks` feature for the wrapped Codex run and
+  restores any prior project-local hooks file on exit
 - Supports `--per-file` mode and `{{file}}`/`{{files}}` template variables
 
 ### `gemini-watch`

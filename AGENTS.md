@@ -19,21 +19,21 @@ Each iteration starts as a brand-new session. The agent picks up previous work t
 ## Structure
 
 - `claude-loop` — Loop wrapper for Claude Code using Stop hooks
-- `codex-loop` — Standalone loop wrapper for Codex CLI using plain process restarts
+- `codex-loop` — Standalone loop wrapper for Codex CLI using Stop hooks
 - `gemini-loop` — Loop wrapper for Gemini CLI using AfterAgent hooks
 - `copilot-loop` — Loop wrapper for GitHub Copilot CLI using agentStop hooks
 - `cursor-loop` — Standalone loop wrapper for Cursor Agent CLI using plain process restarts
 - `opencode-loop` — Standalone loop wrapper for OpenCode CLI using plain process restarts
 - `cline-loop` — Standalone loop wrapper for Cline CLI using plain process restarts
 - `claude-files` — File-list wrapper for Claude Code using Stop hooks
-- `codex-files` — Standalone file-list wrapper for Codex CLI using plain process restarts
+- `codex-files` — Standalone file-list wrapper for Codex CLI using Stop hooks
 - `gemini-files` — File-list wrapper for Gemini CLI using AfterAgent hooks
 - `copilot-files` — File-list wrapper for GitHub Copilot CLI using agentStop hooks
 - `cursor-files` — Standalone file-list wrapper for Cursor Agent CLI using plain process restarts
 - `opencode-files` — Standalone file-list wrapper for OpenCode CLI using plain process restarts
 - `cline-files` — Standalone file-list wrapper for Cline CLI using plain process restarts
 - `claude-watch` — File-change trigger wrapper for Claude Code using Stop hooks
-- `codex-watch` — Standalone file-change trigger wrapper for Codex CLI
+- `codex-watch` — Standalone file-change trigger wrapper for Codex CLI using Stop hooks
 - `gemini-watch` — File-change trigger wrapper for Gemini CLI using AfterAgent hooks
 - `copilot-watch` — File-change trigger wrapper for GitHub Copilot CLI using agentStop hooks
 - `cursor-watch` — Standalone file-change trigger wrapper for Cursor Agent CLI

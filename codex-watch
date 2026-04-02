@@ -7,12 +7,12 @@
 #
 # DESCRIPTION
 #     Watches directories for file creation and modification, then launches
-#     Codex CLI in response. When Codex finishes its work, the watcher returns
-#     to monitoring. A cooldown prevents over-triggering from rapid saves.
+#     Codex CLI in response. When Codex finishes a turn, the watcher regains
+#     control and returns to monitoring. A cooldown prevents over-triggering
+#     from rapid saves.
 #
-#     Codex must be run in a mode that exits on completion (e.g. `codex exec`)
-#     for autonomous watching to work. Interactive Codex sessions still launch
-#     but the watcher cannot continue until the session exits.
+#     Uses Codex's Stop hook mechanism to ensure Codex exits after each
+#     trigger, supporting both interactive and `exec` modes.
 #
 # OPTIONS
 #     --watch-dir DIR
@@ -31,8 +31,8 @@
 #         Default: batch mode (one Codex run for all changed files)
 #
 #     --completion-promise TEXT
-#         Stop the watcher when TEXT appears in Codex output
-#         Note: promise matching is best-effort for full-screen TUI sessions
+#     --loop-completion-promise TEXT
+#         Stop the watcher when TEXT appears in Codex's latest assistant message
 #
 #     --max-triggers N
 #         Maximum number of triggers before exiting. Default: 0 (unlimited)
@@ -63,8 +63,9 @@
 #     codex-watch --watch-dir ./src --exclude '*.log' --cooldown 10 -- exec "fix issues"
 #
 # DEPENDENCIES
+#     - bash
 #     - codex
-#     - script (only needed for interactive completion-promise capture)
+#     - jq
 #     - fswatch (recommended; falls back to find -newer polling)
 #
 
@@ -89,9 +90,18 @@ SENTINEL_FILE=""
 USE_FSWATCH=false
 PER_FILE=false
 CHANGED_FILES=""
-TRANSCRIPT_FILE=""
 PRE_RUN_SENTINEL=""
 SKIP_WAIT=false
+PROJECT_DIR=""
+CODEX_DIR=""
+HOOKS_DIR=""
+STATE_FILE=""
+HOOKS_FILE=""
+HOOKS_FILE_BACKUP=""
+HOOK_SCRIPT_PATH=""
+DEBUG_FLAG_FILE=""
+HOOK_LOG_FILE=""
+HOOKS_MODIFIED=false
 
 log() {
   [[ "$DEBUG" == "true" ]] && printf '[%s] %s\n' "$WRAPPER_NAME" "$1" >&2 || true
@@ -116,7 +126,13 @@ check_dependencies() {
     log_error "$AGENT_NAME executable not found: $AGENT_BIN"
     exit 1
   }
-  if command -v fswatch &>/dev/null; then
+
+  command -v jq >/dev/null 2>&1 || {
+    log_error "jq is required but not installed."
+    exit 1
+  }
+
+  if command -v fswatch >/dev/null 2>&1; then
     USE_FSWATCH=true
     log "using fswatch for file monitoring"
   else
@@ -129,32 +145,55 @@ parse_args() {
     case "$1" in
       --watch-dir)
         [[ $# -ge 2 ]] || { log_error "--watch-dir requires a value."; exit 1; }
-        WATCH_DIRS+=("$(expand_leading_tilde "$2")"); shift 2 ;;
+        WATCH_DIRS+=("$(expand_leading_tilde "$2")")
+        shift 2
+        ;;
       --include)
         [[ $# -ge 2 ]] || { log_error "--include requires a value."; exit 1; }
-        INCLUDE_PATTERNS+=("$(expand_leading_tilde "$2")"); shift 2 ;;
+        INCLUDE_PATTERNS+=("$(expand_leading_tilde "$2")")
+        shift 2
+        ;;
       --cooldown)
         [[ $# -ge 2 ]] || { log_error "--cooldown requires a value."; exit 1; }
-        COOLDOWN_SECONDS="$2"; shift 2 ;;
+        COOLDOWN_SECONDS="$2"
+        shift 2
+        ;;
       --completion-promise|--loop-completion-promise)
         [[ $# -ge 2 ]] || { log_error "$1 requires a value."; exit 1; }
-        COMPLETION_PROMISE="$2"; shift 2 ;;
+        COMPLETION_PROMISE="$2"
+        shift 2
+        ;;
       --max-triggers)
         [[ $# -ge 2 ]] || { log_error "--max-triggers requires a value."; exit 1; }
-        MAX_TRIGGERS="$2"; shift 2 ;;
+        MAX_TRIGGERS="$2"
+        shift 2
+        ;;
       --per-file)
-        PER_FILE=true; shift ;;
+        PER_FILE=true
+        shift
+        ;;
       --exclude|--ignore)
         [[ $# -ge 2 ]] || { log_error "$1 requires a value."; exit 1; }
-        IGNORE_PATTERNS+=("$2"); shift 2 ;;
+        IGNORE_PATTERNS+=("$2")
+        shift 2
+        ;;
       --debug|--loop-debug)
-        DEBUG=true; shift ;;
+        DEBUG=true
+        shift
+        ;;
       --help|-h)
-        show_usage; exit 0 ;;
+        show_usage
+        exit 0
+        ;;
       --)
-        shift; AGENT_ARGS+=("$@"); break ;;
+        shift
+        AGENT_ARGS+=("$@")
+        break
+        ;;
       *)
-        AGENT_ARGS+=("$1"); shift ;;
+        AGENT_ARGS+=("$1")
+        shift
+        ;;
     esac
   done
 }
@@ -276,10 +315,18 @@ path_to_absolute() {
   local path="$1"
   path=$(expand_leading_tilde "$path")
   case "$path" in
-    /*) printf '%s\n' "$path" ;;
-    .) printf '%s\n' "$PWD" ;;
-    ./*) printf '%s\n' "$PWD/${path#./}" ;;
-    *) printf '%s\n' "$PWD/$path" ;;
+    /*)
+      printf '%s\n' "$path"
+      ;;
+    .)
+      printf '%s\n' "$PWD"
+      ;;
+    ./*)
+      printf '%s\n' "$PWD/${path#./}"
+      ;;
+    *)
+      printf '%s\n' "$PWD/$path"
+      ;;
   esac
 }
 
@@ -295,6 +342,15 @@ path_relative_to_pwd() {
   else
     printf '%s\n' "$path"
   fi
+}
+
+path_is_within() {
+  local path="$1"
+  local base="$2"
+  local abs_path abs_base
+  abs_path=$(path_to_absolute "$path")
+  abs_base=$(path_to_absolute "$base")
+  [[ "$abs_path" == "$abs_base" || "$abs_path" == "$abs_base/"* ]]
 }
 
 value_matches_glob_pattern() {
@@ -328,7 +384,8 @@ path_matches_pattern() {
 
 should_skip_path() {
   local path="$1"
-  [[ "$(basename -- "$path")" == ".DS_Store" ]]
+  [[ "$(basename -- "$path")" == ".DS_Store" ]] && return 0
+  [[ -n "$CODEX_DIR" ]] && path_is_within "$path" "$CODEX_DIR"
 }
 
 should_track_path() {
@@ -385,31 +442,217 @@ validate_config() {
   WATCH_DIRS=("${normalized[@]}")
 }
 
-setup_transcript_file() {
-  [[ -n "$COMPLETION_PROMISE" ]] || return 0
-  TRANSCRIPT_FILE="$(mktemp "${TMPDIR:-/tmp}/${WRAPPER_NAME}.XXXXXX")"
+resolve_project_dir() {
+  local candidate="$PWD"
+  local i arg
+
+  for ((i = 0; i < ${#AGENT_ARGS[@]}; i++)); do
+    arg="${AGENT_ARGS[$i]}"
+    case "$arg" in
+      -C|--cd)
+        if (( i + 1 < ${#AGENT_ARGS[@]} )); then
+          candidate="${AGENT_ARGS[$((i + 1))]}"
+        fi
+        ;;
+      --cd=*)
+        candidate="${arg#--cd=}"
+        ;;
+    esac
+  done
+
+  candidate=$(path_to_absolute "$candidate")
+  PROJECT_DIR=$(cd "$candidate" 2>/dev/null && pwd) || {
+    log_error "cannot access codex working directory: $candidate"
+    exit 1
+  }
+}
+
+initialize_paths() {
+  CODEX_DIR="${PROJECT_DIR}/.codex"
+  HOOKS_DIR="${CODEX_DIR}/hooks"
+  STATE_FILE="${CODEX_DIR}/codex-watch.state.json"
+  HOOKS_FILE="${CODEX_DIR}/hooks.json"
+  HOOKS_FILE_BACKUP="${HOOKS_FILE}.codex-watch-backup"
+  HOOK_SCRIPT_PATH="${HOOKS_DIR}/codex-watch-hook.sh"
+  DEBUG_FLAG_FILE="${CODEX_DIR}/codex-watch.debug"
+  HOOK_LOG_FILE="${CODEX_DIR}/codex-watch-hook.log"
+}
+
+write_state() {
+  local decision="${1:-null}"
+  local hook_called="${2:-false}"
+  local stop_reason="${3:-}"
+
+  mkdir -p "$CODEX_DIR"
+  cat > "$STATE_FILE" << EOF
+{
+  "active": true,
+  "completion_promise": $(printf '%s' "$COMPLETION_PROMISE" | jq -Rs .),
+  "decision": $(if [[ "$decision" == "null" ]]; then echo "null"; else printf '"%s"' "$decision"; fi),
+  "hook_called": $hook_called,
+  "stop_reason": $(printf '%s' "$stop_reason" | jq -Rs .)
+}
+EOF
+}
+
+read_decision() {
+  [[ -f "$STATE_FILE" ]] && jq -r '.decision // "null"' "$STATE_FILE" || echo "null"
+}
+
+read_hook_called() {
+  [[ -f "$STATE_FILE" ]] && jq -r '.hook_called // false' "$STATE_FILE" || echo "false"
+}
+
+read_stop_reason() {
+  [[ -f "$STATE_FILE" ]] && jq -r '.stop_reason // ""' "$STATE_FILE" || echo ""
+}
+
+create_hook_script() {
+  mkdir -p "$HOOKS_DIR"
+  cat > "$HOOK_SCRIPT_PATH" << 'HOOKEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+CODEX_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+STATE_FILE="${CODEX_DIR}/codex-watch.state.json"
+DEBUG_FLAG_FILE="${CODEX_DIR}/codex-watch.debug"
+HOOK_LOG_FILE="${CODEX_DIR}/codex-watch-hook.log"
+
+debug_log() {
+  [[ -f "$DEBUG_FLAG_FILE" ]] || return 0
+  mkdir -p "$(dirname "$HOOK_LOG_FILE")"
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$HOOK_LOG_FILE"
+}
+
+INPUT=$(cat)
+
+[[ ! -f "$STATE_FILE" ]] && exit 0
+
+STATE=$(cat "$STATE_FILE")
+[[ $(echo "$STATE" | jq -r '.active // false') != "true" ]] && exit 0
+
+TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path // empty')
+COMPLETION_PROMISE=$(echo "$STATE" | jq -r '.completion_promise // ""')
+LAST_ASSISTANT_MESSAGE=$(echo "$INPUT" | jq -r '.last_assistant_message // empty')
+STOP_HOOK_ACTIVE=$(echo "$INPUT" | jq -r '.stop_hook_active // false')
+ASSISTANT_TEXT="$LAST_ASSISTANT_MESSAGE"
+
+debug_log "Stop hook started: completion_promise=${COMPLETION_PROMISE:-<none>} stop_hook_active=$STOP_HOOK_ACTIVE transcript_path=${TRANSCRIPT_PATH:-<none>}"
+
+if [[ -z "$ASSISTANT_TEXT" ]] && [[ -n "$TRANSCRIPT_PATH" ]] && [[ -f "$TRANSCRIPT_PATH" ]]; then
+  ASSISTANT_TEXT=$(jq -r '
+    select(.type == "assistant")
+    | .message.content[]?
+    | select(.type == "text")
+    | .text // empty
+  ' "$TRANSCRIPT_PATH" 2>/dev/null | tail -n 1 || true)
+fi
+
+DECISION="done"
+STOP_REASON=""
+
+if [[ -n "$COMPLETION_PROMISE" ]] && [[ -n "$ASSISTANT_TEXT" ]] && grep -qF -- "$COMPLETION_PROMISE" <<< "$ASSISTANT_TEXT"; then
+  DECISION="complete"
+  STOP_REASON="Completion promise matched."
+  debug_log "decision=complete"
+else
+  debug_log "decision=done"
+fi
+
+jq --arg decision "$DECISION" --arg reason "$STOP_REASON" \
+  '.decision = $decision | .hook_called = true | .stop_reason = $reason' \
+  "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+
+if [[ -n "$STOP_REASON" ]]; then
+  jq -cn --arg reason "$STOP_REASON" '{"continue": false, "stopReason": $reason}'
+else
+  jq -cn '{"continue": false}'
+fi
+
+debug_log "sending SIGTERM to codex process (PID=$PPID)"
+kill -TERM "$PPID" 2>/dev/null || true
+exit 0
+HOOKEOF
+
+  chmod +x "$HOOK_SCRIPT_PATH"
+  if [[ "$DEBUG" == "true" ]]; then
+    touch "$DEBUG_FLAG_FILE"
+  fi
+}
+
+merge_hooks_file() {
+  local tmp_file
+
+  mkdir -p "$CODEX_DIR"
+
+  if [[ -f "$HOOKS_FILE" ]]; then
+    cp "$HOOKS_FILE" "$HOOKS_FILE_BACKUP"
+  fi
+
+  if [[ -f "$HOOKS_FILE" ]]; then
+    tmp_file=$(mktemp "${TMPDIR:-/tmp}/${WRAPPER_NAME}.hooks.XXXXXX")
+    jq --arg cmd "$HOOK_SCRIPT_PATH" '
+      .hooks = (.hooks // {})
+      | .hooks.Stop = (
+          ((.hooks.Stop // [])
+            | map(
+                .hooks = ((.hooks // []) | map(select(.command != $cmd)))
+              )
+            | map(select((.hooks | length) > 0))
+          )
+          + [{"hooks": [{"type": "command", "command": $cmd, "timeout": 30}]}]
+        )
+    ' "$HOOKS_FILE" > "$tmp_file"
+    mv "$tmp_file" "$HOOKS_FILE"
+  else
+    jq -n --arg cmd "$HOOK_SCRIPT_PATH" '
+      {
+        hooks: {
+          Stop: [
+            {
+              hooks: [
+                {
+                  type: "command",
+                  command: $cmd,
+                  timeout: 30
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ' > "$HOOKS_FILE"
+  fi
+
+  HOOKS_MODIFIED=true
+  log "hook registered in $HOOKS_FILE"
+}
+
+restore_hooks_file() {
+  [[ "$HOOKS_MODIFIED" == "true" ]] || return 0
+
+  if [[ -f "$HOOKS_FILE_BACKUP" ]]; then
+    mv "$HOOKS_FILE_BACKUP" "$HOOKS_FILE"
+  else
+    rm -f "$HOOKS_FILE"
+  fi
+
+  HOOKS_MODIFIED=false
 }
 
 cleanup() {
   local exit_code=$?
-  [[ -n "$TRANSCRIPT_FILE" ]] && rm -f "$TRANSCRIPT_FILE"
+
+  rm -f "$HOOK_SCRIPT_PATH"
+  rm -f "$DEBUG_FLAG_FILE"
+  rm -f "$HOOK_LOG_FILE"
+  restore_hooks_file
+  rm -f "$STATE_FILE"
   [[ -n "$SENTINEL_FILE" ]] && rm -f "$SENTINEL_FILE"
   [[ -n "$PRE_RUN_SENTINEL" ]] && rm -f "$PRE_RUN_SENTINEL"
+  rmdir "$HOOKS_DIR" 2>/dev/null || true
+  rmdir "$CODEX_DIR" 2>/dev/null || true
   exit "$exit_code"
-}
-
-transcript_contains_promise() {
-  [[ -n "$COMPLETION_PROMISE" ]] || return 1
-  [[ -n "$TRANSCRIPT_FILE" && -f "$TRANSCRIPT_FILE" ]] || return 1
-  if LC_ALL=C grep -aFq -- "$COMPLETION_PROMISE" "$TRANSCRIPT_FILE"; then
-    return 0
-  fi
-  if command -v strings >/dev/null 2>&1; then
-    if LC_ALL=C strings -a -n 1 "$TRANSCRIPT_FILE" | grep -Fq -- "$COMPLETION_PROMISE"; then
-      return 0
-    fi
-  fi
-  return 1
 }
 
 cooldown_remaining() {
@@ -451,7 +694,9 @@ wait_for_changes_poll() {
   while true; do
     sleep 5
     local find_args=()
-    for dir in "${WATCH_DIRS[@]}"; do find_args+=("$dir"); done
+    for dir in "${WATCH_DIRS[@]}"; do
+      find_args+=("$dir")
+    done
     find_args+=(-newer "$SENTINEL_FILE" -not -name '.DS_Store')
     find_args+=(-type f)
     local changed
@@ -479,7 +724,9 @@ wait_for_changes() {
 check_changes_during_run() {
   [[ -z "$PRE_RUN_SENTINEL" ]] && return 1
   local find_args=()
-  for dir in "${WATCH_DIRS[@]}"; do find_args+=("$dir"); done
+  for dir in "${WATCH_DIRS[@]}"; do
+    find_args+=("$dir")
+  done
   find_args+=(-newer "$PRE_RUN_SENTINEL" -not -name '.DS_Store')
   find_args+=(-type f)
   local changed
@@ -509,58 +756,81 @@ expand_template() {
 
 run_agent_once() {
   local -a args=("$@")
+  local -a run_args=(-c "features.codex_hooks=true" "${args[@]}")
+  local codex_exit_code decision hook_called stop_reason
 
-  if [[ -n "$TRANSCRIPT_FILE" ]]; then
-    : > "$TRANSCRIPT_FILE"
-  fi
+  write_state "null" "false"
 
   set +e
-  if [[ -n "$COMPLETION_PROMISE" ]]; then
-    if [[ -t 0 && -t 1 ]]; then
-      script -q "$TRANSCRIPT_FILE" "$AGENT_BIN" "${args[@]}"
-      LAST_EXIT_CODE=$?
-    else
-      "$AGENT_BIN" "${args[@]}" 2>&1 | tee "$TRANSCRIPT_FILE"
-      LAST_EXIT_CODE=${PIPESTATUS[0]}
-    fi
-  else
-    "$AGENT_BIN" "${args[@]}"
-    LAST_EXIT_CODE=$?
-  fi
+  "$AGENT_BIN" "${run_args[@]}"
+  codex_exit_code=$?
   set -e
 
-  log "$AGENT_BIN exited with code $LAST_EXIT_CODE"
+  decision=$(read_decision)
+  hook_called=$(read_hook_called)
+  stop_reason=$(read_stop_reason)
+
+  log "$AGENT_BIN exited (code=$codex_exit_code, decision=$decision, hook=$hook_called, reason=${stop_reason:-<none>})"
+
+  LAST_EXIT_CODE=$codex_exit_code
+  LAST_DECISION=$decision
+  LAST_HOOK_CALLED=$hook_called
 }
 
 # Returns: 0 = continue watching, 1 = stop watcher (sets WATCHER_EXIT_CODE)
 eval_run_result() {
+  if [[ "$LAST_HOOK_CALLED" != "true" ]]; then
+    case "$LAST_EXIT_CODE" in
+      129|130|137|143)
+        log "interrupted by signal"
+        WATCHER_EXIT_CODE=$LAST_EXIT_CODE
+        return 1
+        ;;
+      *)
+        log "hook not called; exiting with codex's status"
+        WATCHER_EXIT_CODE=$LAST_EXIT_CODE
+        return 1
+        ;;
+    esac
+  fi
+
   case "$LAST_EXIT_CODE" in
-    0) ;;
-    129|130|137|143)
-      log "interrupted by signal"
-      WATCHER_EXIT_CODE=$LAST_EXIT_CODE
-      return 1
+    0|129|130|137|143)
       ;;
     *)
       log "non-zero exit code: $LAST_EXIT_CODE, continuing to watch"
       ;;
   esac
-  if transcript_contains_promise; then
-    log "completion promise matched after trigger $TRIGGER_COUNT"
-    WATCHER_EXIT_CODE=0
-    return 1
-  fi
-  return 0
+
+  case "$LAST_DECISION" in
+    complete)
+      log "completion promise matched after trigger $TRIGGER_COUNT"
+      WATCHER_EXIT_CODE=0
+      return 1
+      ;;
+    done)
+      return 0
+      ;;
+    *)
+      log_error "unexpected decision: $LAST_DECISION"
+      WATCHER_EXIT_CODE=1
+      return 1
+      ;;
+  esac
 }
 
 main() {
   parse_args "$@"
   validate_config
   check_dependencies
-  setup_transcript_file
+  resolve_project_dir
+  initialize_paths
   trap cleanup EXIT INT TERM
 
-  log "watch_dirs=${WATCH_DIRS[*]} include_patterns=${INCLUDE_PATTERNS[*]:-<none>} exclude_patterns=${IGNORE_PATTERNS[*]:-<none>} cooldown=${COOLDOWN_SECONDS}s max_triggers=$MAX_TRIGGERS per_file=$PER_FILE completion_promise=${COMPLETION_PROMISE:-<none>}"
+  log "project_dir=$PROJECT_DIR watch_dirs=${WATCH_DIRS[*]} include_patterns=${INCLUDE_PATTERNS[*]:-<none>} exclude_patterns=${IGNORE_PATTERNS[*]:-<none>} cooldown=${COOLDOWN_SECONDS}s max_triggers=$MAX_TRIGGERS per_file=$PER_FILE completion_promise=${COMPLETION_PROMISE:-<none>}"
+
+  create_hook_script
+  merge_hooks_file
 
   WATCHER_EXIT_CODE=0
 
@@ -582,7 +852,6 @@ main() {
     TRIGGER_COUNT=$((TRIGGER_COUNT + 1))
     LAST_RUN_TIMESTAMP=$(date +%s)
 
-    # Record pre-run timestamp to detect changes during agent execution
     if [[ -z "$PRE_RUN_SENTINEL" ]]; then
       PRE_RUN_SENTINEL="$(mktemp "${TMPDIR:-/tmp}/${WRAPPER_NAME}-prerun.XXXXXX")"
     fi
@@ -616,7 +885,6 @@ main() {
       return 0
     fi
 
-    # Check for file changes that occurred during agent execution
     if check_changes_during_run; then
       SKIP_WAIT=true
       LAST_RUN_TIMESTAMP=$(date +%s)
