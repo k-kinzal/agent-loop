@@ -356,7 +356,7 @@ add_default_watch_dirs() {
   if [[ ${#WATCH_DIRS[@]} -eq 0 && ${#INCLUDE_PATTERNS[@]} -eq 0 ]]; then
     WATCH_DIRS+=(".")
   fi
-  for pattern in "${INCLUDE_PATTERNS[@]+"${INCLUDE_PATTERNS[@]}"}"; do
+  for pattern in "${INCLUDE_PATTERNS[@]}"; do
     derived=$(derive_watch_dir_from_pattern "$pattern")
     WATCH_DIRS+=("$derived")
   done
@@ -648,9 +648,16 @@ cooldown_remaining() {
 }
 
 wait_for_changes_fswatch() {
+  local fswatch_args=(-r -1)
+  # Escape dots in absolute path for fswatch regex
   local escaped_github_dir="${GITHUB_DIR//./\\.}"
-  local fswatch_args=(-r -1 --exclude "${escaped_github_dir}/" --exclude '\.DS_Store')
+  fswatch_args+=(--exclude "${escaped_github_dir}/")
+  fswatch_args+=(--exclude '\.DS_Store')
+  for pattern in "${IGNORE_PATTERNS[@]+"${IGNORE_PATTERNS[@]}"}"; do
+    fswatch_args+=(--exclude "$pattern")
+  done
   fswatch_args+=("${WATCH_DIRS[@]}")
+
   while true; do
     log "waiting for changes (fswatch)..."
     local changed
