@@ -249,10 +249,12 @@ All `*-files` wrappers support:
 - Depends on `copilot`, `jq`, and optionally `fswatch`
 - Supports `--include`/`--exclude` glob filters and can derive watch roots from
   `--include` when `--watch-dir` is omitted
-- Uses a project-local Copilot `agentStop` hook under `.github/hooks/`
+- Uses project-local Copilot `agentStop` and `errorOccurred` hooks under
+  `.github/hooks/`
 - Accepts a single positional prompt and runs it as `copilot -i` when no
   explicit Copilot mode or subcommand is provided
-- Terminates Copilot after each trigger via SIGTERM
+- Terminates Copilot after each successful trigger via SIGTERM and keeps
+  watching after hook-observable execution errors
 
 ### `cursor-watch`
 

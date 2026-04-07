@@ -514,7 +514,8 @@ write_state() {
   "active": true,
   "completion_promise": $(printf '%s' "$COMPLETION_PROMISE" | jq -Rs .),
   "decision": $(if [ "$decision" = "null" ]; then echo "null"; else echo "\"$decision\""; fi),
-  "hook_called": $hook_called
+  "hook_called": $hook_called,
+  "hook_event": ""
 }
 EOF
 }
@@ -525,6 +526,10 @@ read_decision() {
 
 read_hook_called() {
   [[ -f "$STATE_FILE" ]] && jq -r '.hook_called // false' "$STATE_FILE" || echo "false"
+}
+
+read_hook_event() {
+  [[ -f "$STATE_FILE" ]] && jq -r '.hook_event // ""' "$STATE_FILE" || echo ""
 }
 
 create_hook_script() {
@@ -560,22 +565,33 @@ INPUT=$(cat)
 STATE=$(cat "$STATE_FILE")
 [[ $(echo "$STATE" | jq -r '.active // false') != "true" ]] && exit 0
 
-TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcriptPath // empty')
-COMPLETION_PROMISE=$(echo "$STATE" | jq -r '.completion_promise // ""')
-ASSISTANT_TEXT=$(extract_last_assistant_message "$TRANSCRIPT_PATH")
+HOOK_EVENT="${COPILOT_WATCH_HOOK_EVENT:-agentStop}"
 
-debug_log "agentStop hook started: completion_promise=${COMPLETION_PROMISE:-<none>} transcript_path=${TRANSCRIPT_PATH:-<none>}"
-
-DECISION="done"
-if [[ -n "$COMPLETION_PROMISE" ]] && [[ -n "$ASSISTANT_TEXT" ]] && grep -qF -- "$COMPLETION_PROMISE" <<< "$ASSISTANT_TEXT"; then
-  DECISION="complete"
-  debug_log "decision=complete (completion promise matched)"
+if [[ "$HOOK_EVENT" == "errorOccurred" ]]; then
+  ERROR_NAME=$(echo "$INPUT" | jq -r '.error.name // "Error"')
+  ERROR_MESSAGE=$(echo "$INPUT" | jq -r '.error.message // ""')
+  debug_log "errorOccurred hook started: error=${ERROR_NAME}: ${ERROR_MESSAGE:-<none>}"
+  jq --arg event "$HOOK_EVENT" '.decision = "done" | .hook_called = true | .hook_event = $event' \
+    "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+  exit 0
 else
-  debug_log "decision=done"
-fi
+  TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcriptPath // empty')
+  COMPLETION_PROMISE=$(echo "$STATE" | jq -r '.completion_promise // ""')
+  ASSISTANT_TEXT=$(extract_last_assistant_message "$TRANSCRIPT_PATH")
 
-jq --arg d "$DECISION" '.decision = $d | .hook_called = true' \
-  "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+  debug_log "agentStop hook started: completion_promise=${COMPLETION_PROMISE:-<none>} transcript_path=${TRANSCRIPT_PATH:-<none>}"
+
+  DECISION="done"
+  if [[ -n "$COMPLETION_PROMISE" ]] && [[ -n "$ASSISTANT_TEXT" ]] && grep -qF -- "$COMPLETION_PROMISE" <<< "$ASSISTANT_TEXT"; then
+    DECISION="complete"
+    debug_log "decision=complete (completion promise matched)"
+  else
+    debug_log "decision=done"
+  fi
+
+  jq --arg d "$DECISION" --arg event "$HOOK_EVENT" '.decision = $d | .hook_called = true | .hook_event = $event' \
+    "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+fi
 
 # Terminate Copilot process so the wrapper regains control
 PARENT_PID=$(ps -o ppid= "$$" 2>/dev/null | tr -d ' ')
@@ -599,6 +615,18 @@ HOOKEOF
     "agentStop": [
       {
         "type": "command",
+        "env": {
+          "COPILOT_WATCH_HOOK_EVENT": "agentStop"
+        },
+        "bash": "./.github/hooks/copilot-watch-hook.sh"
+      }
+    ],
+    "errorOccurred": [
+      {
+        "type": "command",
+        "env": {
+          "COPILOT_WATCH_HOOK_EVENT": "errorOccurred"
+        },
         "bash": "./.github/hooks/copilot-watch-hook.sh"
       }
     ]
@@ -746,15 +774,17 @@ run_copilot_once() {
   local copilot_exit_code=$?
   set -e
 
-  local decision hook_called
+  local decision hook_called hook_event
   decision=$(read_decision)
   hook_called=$(read_hook_called)
+  hook_event=$(read_hook_event)
 
-  log "copilot exited (code=$copilot_exit_code, decision=$decision, hook=$hook_called)"
+  log "copilot exited (code=$copilot_exit_code, decision=$decision, hook=$hook_called, event=${hook_event:-<none>})"
 
   LAST_EXIT_CODE=$copilot_exit_code
   LAST_DECISION=$decision
   LAST_HOOK_CALLED=$hook_called
+  LAST_HOOK_EVENT=$hook_event
 }
 
 eval_run_result() {
@@ -772,6 +802,12 @@ eval_run_result() {
     WATCHER_EXIT_CODE=$LAST_EXIT_CODE
     return 1
   fi
+
+  case "$LAST_HOOK_EVENT" in
+    errorOccurred)
+      log "copilot reported an execution error; continuing to watch"
+      ;;
+  esac
 
   case "$LAST_DECISION" in
     complete)
