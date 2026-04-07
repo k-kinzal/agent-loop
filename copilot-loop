@@ -189,6 +189,7 @@ backup_hook_files() {
   if [[ -f "$HOOK_CONFIG_PATH" ]]; then
     cp "$HOOK_CONFIG_PATH" "$HOOK_CONFIG_BACKUP"
   fi
+  return 0
 }
 
 restore_hook_file() {

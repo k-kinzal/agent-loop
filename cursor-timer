@@ -1,0 +1,467 @@
+#!/usr/bin/env bash
+#
+# cursor-timer - Run Cursor Agent CLI on a cron schedule
+#
+# USAGE
+#     cursor-timer [OPTIONS] [--] [CURSOR_AGENT_ARGS...]
+#
+# DESCRIPTION
+#     Waits for the next minute that matches a 5-field cron expression, then
+#     launches Cursor Agent CLI. After Cursor exits, cursor-timer waits for the
+#     next matching minute and launches a fresh process.
+#
+#     Interactive Cursor sessions are supported, but the timer can only
+#     continue after Cursor exits. For autonomous scheduled runs, prefer
+#     `cursor-agent --print ...`.
+#
+# OPTIONS
+#     --cron EXPR
+#         Cron expression in "minute hour day month weekday" format.
+#         Supports ranges, lists, steps, month names, weekday names, and
+#         aliases such as @hourly, @daily, @weekly, @monthly, and @yearly.
+#
+#     --max-triggers N
+#         Stop after N scheduled Cursor runs. Default: 0 (unlimited)
+#
+#     --completion-promise TEXT
+#     --loop-completion-promise TEXT
+#         Stop the timer when TEXT appears in Cursor output
+#         Note: promise matching is best-effort for full-screen TUI sessions
+#
+#     --debug
+#     --loop-debug
+#         Enable cursor-timer debug logging
+#
+#     --help, -h
+#         Show this help message
+#
+#     All other options are passed through to cursor-agent.
+#
+# EXAMPLES
+#     cursor-timer --cron '0 * * * *' -- --print "summarize repo status"
+#     cursor-timer --cron '*/15 * * * *' -- --print "review current work"
+#     cursor-timer --cron '@daily' --completion-promise "DONE" -- --print "work"
+#
+# DEPENDENCIES
+#     - bash
+#     - cursor-agent
+#     - script (only needed for interactive completion-promise capture)
+#
+
+set -euo pipefail
+
+readonly WRAPPER_NAME="cursor-timer"
+readonly AGENT_NAME="Cursor Agent CLI"
+: "${CURSOR_TIMER_BIN:=cursor-agent}"
+readonly AGENT_BIN="$CURSOR_TIMER_BIN"
+
+CRON_EXPR=""
+MAX_TRIGGERS=0
+COMPLETION_PROMISE=""
+DEBUG=false
+TRIGGER_COUNT=0
+AGENT_ARGS=()
+TRANSCRIPT_FILE=""
+DATE_BACKEND=""
+
+MINUTE_FIELD=""
+HOUR_FIELD=""
+DAY_OF_MONTH_FIELD=""
+MONTH_FIELD=""
+DAY_OF_WEEK_FIELD=""
+MINUTE_VALUES=""
+HOUR_VALUES=""
+DAY_OF_MONTH_VALUES=""
+MONTH_VALUES=""
+DAY_OF_WEEK_VALUES=""
+
+LAST_EXIT_CODE=0
+TIMER_EXIT_CODE=0
+
+log() { [[ "$DEBUG" == "true" ]] && printf '[%s] %s\n' "$WRAPPER_NAME" "$1" >&2 || true; }
+log_error() { printf '[%s] ERROR: %s\n' "$WRAPPER_NAME" "$1" >&2; }
+
+show_usage() {
+  awk '
+    NR >= 2 {
+      if ($0 !~ /^#/) { exit }
+      sub(/^# ?/, "")
+      print
+    }
+  ' "$0"
+}
+
+check_dependencies() {
+  command -v "$AGENT_BIN" >/dev/null 2>&1 || {
+    log_error "$AGENT_NAME executable not found: $AGENT_BIN"
+    exit 1
+  }
+  if [[ -n "$COMPLETION_PROMISE" ]] && [[ -t 0 && -t 1 ]]; then
+    command -v script >/dev/null 2>&1 || {
+      log_error "script is required for interactive completion-promise capture."
+      exit 1
+    }
+  fi
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --cron)
+        [[ $# -ge 2 ]] || { log_error "--cron requires a value."; exit 1; }
+        CRON_EXPR="$2"; shift 2 ;;
+      --max-triggers)
+        [[ $# -ge 2 ]] || { log_error "--max-triggers requires a value."; exit 1; }
+        MAX_TRIGGERS="$2"; shift 2 ;;
+      --completion-promise|--loop-completion-promise)
+        [[ $# -ge 2 ]] || { log_error "$1 requires a value."; exit 1; }
+        COMPLETION_PROMISE="$2"; shift 2 ;;
+      --debug|--loop-debug)
+        DEBUG=true; shift ;;
+      --help|-h)
+        show_usage; exit 0 ;;
+      --)
+        shift; AGENT_ARGS+=("$@"); break ;;
+      *)
+        AGENT_ARGS+=("$1"); shift ;;
+    esac
+  done
+}
+
+init_date_backend() {
+  if date -r 0 '+%Y' >/dev/null 2>&1; then
+    DATE_BACKEND="bsd"
+  elif date -d '@0' '+%Y' >/dev/null 2>&1; then
+    DATE_BACKEND="gnu"
+  else
+    log_error "this system date command is not supported."
+    exit 1
+  fi
+}
+
+format_epoch() {
+  local epoch="$1" format="$2"
+  case "$DATE_BACKEND" in
+    bsd) date -r "$epoch" "$format" ;;
+    gnu) date -d "@$epoch" "$format" ;;
+    *) log_error "date backend not initialized."; exit 1 ;;
+  esac
+}
+
+epoch_to_cron_fields() {
+  format_epoch "$1" '+%M %H %d %m %w'
+}
+
+format_human_time() {
+  format_epoch "$1" '+%Y-%m-%d %H:%M:%S %Z'
+}
+
+normalize_cron_expr() {
+  case "$CRON_EXPR" in
+    @yearly|@annually) CRON_EXPR='0 0 1 1 *' ;;
+    @monthly) CRON_EXPR='0 0 1 * *' ;;
+    @weekly) CRON_EXPR='0 0 * * 0' ;;
+    @daily|@midnight) CRON_EXPR='0 0 * * *' ;;
+    @hourly) CRON_EXPR='0 * * * *' ;;
+  esac
+}
+
+normalize_field_names() {
+  local value="$1" kind="$2"
+  value=$(printf '%s' "$value" | tr '[:lower:]' '[:upper:]')
+  case "$kind" in
+    month)
+      value="${value//JAN/1}"
+      value="${value//FEB/2}"
+      value="${value//MAR/3}"
+      value="${value//APR/4}"
+      value="${value//MAY/5}"
+      value="${value//JUN/6}"
+      value="${value//JUL/7}"
+      value="${value//AUG/8}"
+      value="${value//SEP/9}"
+      value="${value//OCT/10}"
+      value="${value//NOV/11}"
+      value="${value//DEC/12}"
+      ;;
+    weekday)
+      value="${value//SUN/0}"
+      value="${value//MON/1}"
+      value="${value//TUE/2}"
+      value="${value//WED/3}"
+      value="${value//THU/4}"
+      value="${value//FRI/5}"
+      value="${value//SAT/6}"
+      ;;
+  esac
+  printf '%s\n' "$value"
+}
+
+parse_cron_number() {
+  local raw="$1" min="$2" max="$3" field_name="$4"
+  [[ "$raw" =~ ^[0-9]+$ ]] || { log_error "invalid $field_name field value: $raw"; exit 1; }
+  local value=$((10#$raw))
+  (( value >= min && value <= max )) || { log_error "$field_name field value out of range: $raw"; exit 1; }
+  printf '%s\n' "$value"
+}
+
+canonicalize_weekday() {
+  local value="$1"
+  if [[ "$value" -eq 7 ]]; then
+    printf '0\n'
+  else
+    printf '%s\n' "$value"
+  fi
+}
+
+build_value_set() {
+  local raw_field="$1" parse_min="$2" parse_max="$3" output_min="$4" output_max="$5"
+  local kind="$6" field_name="$7" output_var="$8"
+  local normalized part base step start end current canonical values=""
+  local -a allowed=()
+
+  normalized=$(normalize_field_names "$raw_field" "$kind")
+  IFS=',' read -r -a parts <<< "$normalized"
+  [[ ${#parts[@]} -gt 0 ]] || { log_error "invalid $field_name field: $raw_field"; exit 1; }
+
+  for part in "${parts[@]}"; do
+    [[ -n "$part" ]] || { log_error "invalid $field_name field: $raw_field"; exit 1; }
+    base="$part"
+    step=1
+    if [[ "$part" == */* ]]; then
+      [[ "$part" != */*/* ]] || { log_error "invalid $field_name field step: $part"; exit 1; }
+      base="${part%/*}"
+      step="${part#*/}"
+      [[ "$step" =~ ^[0-9]+$ ]] || { log_error "invalid $field_name field step: $part"; exit 1; }
+      (( 10#$step > 0 )) || { log_error "$field_name field step must be greater than zero: $part"; exit 1; }
+      step=$((10#$step))
+    fi
+
+    if [[ "$base" == "*" ]]; then
+      start="$parse_min"
+      end="$parse_max"
+    elif [[ "$base" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      start=$(parse_cron_number "${BASH_REMATCH[1]}" "$parse_min" "$parse_max" "$field_name")
+      end=$(parse_cron_number "${BASH_REMATCH[2]}" "$parse_min" "$parse_max" "$field_name")
+      (( start <= end )) || { log_error "$field_name field range start exceeds end: $part"; exit 1; }
+    else
+      start=$(parse_cron_number "$base" "$parse_min" "$parse_max" "$field_name")
+      end="$start"
+    fi
+
+    for ((current = start; current <= end; current += step)); do
+      if [[ "$kind" == "weekday" ]]; then
+        canonical=$(canonicalize_weekday "$current")
+      else
+        canonical="$current"
+      fi
+      allowed[$canonical]=1
+    done
+  done
+
+  for ((current = output_min; current <= output_max; current++)); do
+    [[ "${allowed[$current]:-0}" == "1" ]] || continue
+    [[ -n "$values" ]] && values+=" "
+    values+="$current"
+  done
+
+  [[ -n "$values" ]] || { log_error "invalid $field_name field: $raw_field"; exit 1; }
+  printf -v "$output_var" '%s' "$values"
+}
+
+value_in_set() {
+  local values="$1" needle="$2"
+  [[ " $values " == *" $needle "* ]]
+}
+
+cron_matches_epoch() {
+  local epoch="$1" minute hour day_of_month month day_of_week
+  local dom_match=false dow_match=false
+  read -r minute hour day_of_month month day_of_week <<< "$(epoch_to_cron_fields "$epoch")"
+  minute=$((10#$minute))
+  hour=$((10#$hour))
+  day_of_month=$((10#$day_of_month))
+  month=$((10#$month))
+  day_of_week=$((10#$day_of_week))
+
+  value_in_set "$MINUTE_VALUES" "$minute" || return 1
+  value_in_set "$HOUR_VALUES" "$hour" || return 1
+  value_in_set "$MONTH_VALUES" "$month" || return 1
+  value_in_set "$DAY_OF_MONTH_VALUES" "$day_of_month" && dom_match=true
+  value_in_set "$DAY_OF_WEEK_VALUES" "$day_of_week" && dow_match=true
+
+  if [[ "$DAY_OF_MONTH_FIELD" == "*" && "$DAY_OF_WEEK_FIELD" == "*" ]]; then
+    return 0
+  fi
+  if [[ "$DAY_OF_MONTH_FIELD" == "*" ]]; then
+    [[ "$dow_match" == "true" ]]
+    return
+  fi
+  if [[ "$DAY_OF_WEEK_FIELD" == "*" ]]; then
+    [[ "$dom_match" == "true" ]]
+    return
+  fi
+  [[ "$dom_match" == "true" || "$dow_match" == "true" ]]
+}
+
+validate_config() {
+  [[ -n "$CRON_EXPR" ]] || { log_error "--cron is required."; exit 1; }
+  [[ "$MAX_TRIGGERS" =~ ^[0-9]+$ ]] || { log_error "max-triggers must be a non-negative integer."; exit 1; }
+
+  normalize_cron_expr
+  init_date_backend
+
+  local -a fields=()
+  read -r -a fields <<< "$CRON_EXPR"
+  [[ ${#fields[@]} -eq 5 ]] || { log_error "cron expression must contain exactly 5 fields."; exit 1; }
+
+  MINUTE_FIELD="${fields[0]}"
+  HOUR_FIELD="${fields[1]}"
+  DAY_OF_MONTH_FIELD="${fields[2]}"
+  MONTH_FIELD="${fields[3]}"
+  DAY_OF_WEEK_FIELD="${fields[4]}"
+
+  build_value_set "$MINUTE_FIELD" 0 59 0 59 minute minute MINUTE_VALUES
+  build_value_set "$HOUR_FIELD" 0 23 0 23 hour hour HOUR_VALUES
+  build_value_set "$DAY_OF_MONTH_FIELD" 1 31 1 31 day_of_month day-of-month DAY_OF_MONTH_VALUES
+  build_value_set "$MONTH_FIELD" 1 12 1 12 month month MONTH_VALUES
+  build_value_set "$DAY_OF_WEEK_FIELD" 0 7 0 6 weekday day-of-week DAY_OF_WEEK_VALUES
+}
+
+setup_transcript_file() {
+  [[ -n "$COMPLETION_PROMISE" ]] || return 0
+  TRANSCRIPT_FILE="$(mktemp "${TMPDIR:-/tmp}/${WRAPPER_NAME}.XXXXXX")"
+}
+
+cleanup() {
+  local exit_code=$?
+  [[ -n "$TRANSCRIPT_FILE" ]] && rm -f "$TRANSCRIPT_FILE"
+  exit "$exit_code"
+}
+
+transcript_contains_promise() {
+  [[ -n "$COMPLETION_PROMISE" ]] || return 1
+  [[ -n "$TRANSCRIPT_FILE" && -f "$TRANSCRIPT_FILE" ]] || return 1
+
+  if LC_ALL=C grep -aFq -- "$COMPLETION_PROMISE" "$TRANSCRIPT_FILE"; then
+    return 0
+  fi
+  if command -v strings >/dev/null 2>&1; then
+    if LC_ALL=C strings -a -n 1 "$TRANSCRIPT_FILE" | grep -Fq -- "$COMPLETION_PROMISE"; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+run_agent_once() {
+  local -a args=("$@")
+
+  if [[ -n "$TRANSCRIPT_FILE" ]]; then
+    : > "$TRANSCRIPT_FILE"
+  fi
+
+  set +e
+  if [[ -n "$COMPLETION_PROMISE" ]]; then
+    if [[ -t 0 && -t 1 ]]; then
+      script -q "$TRANSCRIPT_FILE" "$AGENT_BIN" "${args[@]}"
+      LAST_EXIT_CODE=$?
+    else
+      "$AGENT_BIN" "${args[@]}" 2>&1 | tee "$TRANSCRIPT_FILE"
+      LAST_EXIT_CODE=${PIPESTATUS[0]}
+    fi
+  else
+    "$AGENT_BIN" "${args[@]}"
+    LAST_EXIT_CODE=$?
+  fi
+  set -e
+
+  log "$AGENT_BIN exited with code $LAST_EXIT_CODE"
+}
+
+eval_run_result() {
+  case "$LAST_EXIT_CODE" in
+    0) ;;
+    129|130|137|143)
+      log "interrupted by signal"
+      TIMER_EXIT_CODE=$LAST_EXIT_CODE
+      return 1
+      ;;
+    *)
+      log "non-zero exit code: $LAST_EXIT_CODE, continuing to wait for the next schedule"
+      ;;
+  esac
+
+  if transcript_contains_promise; then
+    log "completion promise matched after trigger $TRIGGER_COUNT"
+    TIMER_EXIT_CODE=0
+    return 1
+  fi
+
+  return 0
+}
+
+next_minute_boundary_epoch() {
+  local now
+  now=$(date +%s)
+  printf '%s\n' $(( ((now / 60) + 1) * 60 ))
+}
+
+current_minute_epoch() {
+  local now
+  now=$(date +%s)
+  printf '%s\n' $(( (now / 60) * 60 ))
+}
+
+sleep_until_epoch() {
+  local target="$1"
+  while true; do
+    local now remaining
+    now=$(date +%s)
+    remaining=$((target - now))
+    (( remaining <= 0 )) && return 0
+    sleep "$remaining"
+  done
+}
+
+main() {
+  parse_args "$@"
+  validate_config
+  check_dependencies
+  setup_transcript_file
+  trap cleanup EXIT INT TERM
+
+  log "cron=$CRON_EXPR max_triggers=$MAX_TRIGGERS completion_promise=${COMPLETION_PROMISE:-<none>}"
+
+  TIMER_EXIT_CODE=0
+
+  while true; do
+    local target_epoch check_epoch
+    target_epoch=$(next_minute_boundary_epoch)
+    log "next schedule check at $(format_human_time "$target_epoch")"
+    sleep_until_epoch "$target_epoch"
+
+    check_epoch=$(current_minute_epoch)
+    if ! cron_matches_epoch "$check_epoch"; then
+      log "schedule did not match at $(format_human_time "$check_epoch")"
+      continue
+    fi
+
+    TRIGGER_COUNT=$((TRIGGER_COUNT + 1))
+    log "schedule matched at $(format_human_time "$check_epoch"), running $AGENT_BIN (trigger $TRIGGER_COUNT)"
+
+    run_agent_once "${AGENT_ARGS[@]}"
+    if ! eval_run_result; then
+      return "$TIMER_EXIT_CODE"
+    fi
+
+    if [[ "$MAX_TRIGGERS" -gt 0 ]] && [[ "$TRIGGER_COUNT" -ge "$MAX_TRIGGERS" ]]; then
+      log "maximum triggers reached: $TRIGGER_COUNT"
+      return 0
+    fi
+
+    log "trigger $TRIGGER_COUNT complete, waiting for next schedule"
+  done
+}
+
+main "$@"

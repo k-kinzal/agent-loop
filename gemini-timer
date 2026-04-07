@@ -1,0 +1,552 @@
+#!/usr/bin/env bash
+#
+# gemini-timer - Run Gemini CLI on a cron schedule
+#
+# USAGE
+#     gemini-timer [OPTIONS] [--] [GEMINI_ARGS...]
+#
+# DESCRIPTION
+#     Waits for the next minute that matches a 5-field cron expression, then
+#     launches Gemini CLI. After Gemini completes a turn, gemini-timer waits
+#     for the next matching minute and launches a fresh Gemini process.
+#
+#     Uses Gemini's AfterAgent hook mechanism so scheduled runs can return
+#     control to the timer in both positional-prompt and interactive modes.
+#
+# OPTIONS
+#     --cron EXPR
+#         Cron expression in "minute hour day month weekday" format.
+#         Supports ranges, lists, steps, month names, weekday names, and
+#         aliases such as @hourly, @daily, @weekly, @monthly, and @yearly.
+#
+#     --max-triggers N
+#         Stop after N scheduled Gemini runs. Default: 0 (unlimited)
+#
+#     --completion-promise TEXT
+#         Stop the timer when TEXT appears in Gemini's final response
+#
+#     --debug
+#         Enable gemini-timer debug logging
+#
+#     --help, -h
+#         Show this help message
+#
+#     All other options are passed through to gemini.
+#
+# EXAMPLES
+#     gemini-timer --cron '0 * * * *' -- "summarize repo status"
+#     gemini-timer --cron '*/30 * * * *' -- -i "review current changes"
+#     gemini-timer --cron '@daily' --completion-promise "DONE" -- "work"
+#
+# DEPENDENCIES
+#     - gemini
+#     - jq
+#
+
+set -euo pipefail
+
+readonly GEMINI_DIR="${PWD}/.gemini"
+readonly HOOKS_DIR="${GEMINI_DIR}/hooks"
+readonly STATE_FILE="${GEMINI_DIR}/gemini-timer.state.json"
+readonly SETTINGS_PROJECT="${GEMINI_DIR}/settings.json"
+readonly HOOK_SCRIPT_PATH="${HOOKS_DIR}/gemini-timer-hook.sh"
+readonly HOOK_LOG_FILE="${GEMINI_DIR}/gemini-timer-hook.log"
+
+CRON_EXPR=""
+MAX_TRIGGERS=0
+COMPLETION_PROMISE=""
+GEMINI_ARGS=()
+SETTINGS_MODIFIED=false
+TARGET_SETTINGS_BACKUP=""
+DEBUG=false
+TRIGGER_COUNT=0
+DATE_BACKEND=""
+
+MINUTE_FIELD=""
+HOUR_FIELD=""
+DAY_OF_MONTH_FIELD=""
+MONTH_FIELD=""
+DAY_OF_WEEK_FIELD=""
+MINUTE_VALUES=""
+HOUR_VALUES=""
+DAY_OF_MONTH_VALUES=""
+MONTH_VALUES=""
+DAY_OF_WEEK_VALUES=""
+
+LAST_EXIT_CODE=0
+LAST_DECISION="null"
+LAST_HOOK_CALLED="false"
+TIMER_EXIT_CODE=0
+
+log() { [[ "$DEBUG" == "true" ]] && echo "[gemini-timer] $1" >&2 || true; }
+log_error() { echo "[gemini-timer] ERROR: $1" >&2; }
+
+show_usage() {
+  awk '
+    NR >= 2 {
+      if ($0 !~ /^#/) { exit }
+      sub(/^# ?/, "")
+      print
+    }
+  ' "$0"
+}
+
+check_dependencies() {
+  command -v jq >/dev/null 2>&1 || { log_error "jq is required but not installed."; exit 1; }
+  command -v gemini >/dev/null 2>&1 || { log_error "gemini CLI is required but not installed."; exit 1; }
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --cron)
+        [[ $# -ge 2 ]] || { log_error "--cron requires a value."; exit 1; }
+        CRON_EXPR="$2"; shift 2 ;;
+      --max-triggers)
+        [[ $# -ge 2 ]] || { log_error "--max-triggers requires a value."; exit 1; }
+        MAX_TRIGGERS="$2"; shift 2 ;;
+      --completion-promise)
+        [[ $# -ge 2 ]] || { log_error "--completion-promise requires a value."; exit 1; }
+        COMPLETION_PROMISE="$2"; shift 2 ;;
+      --debug)
+        DEBUG=true; shift ;;
+      --help|-h)
+        show_usage; exit 0 ;;
+      --)
+        shift; GEMINI_ARGS+=("$@"); break ;;
+      *)
+        GEMINI_ARGS+=("$1"); shift ;;
+    esac
+  done
+}
+
+init_date_backend() {
+  if date -r 0 '+%Y' >/dev/null 2>&1; then
+    DATE_BACKEND="bsd"
+  elif date -d '@0' '+%Y' >/dev/null 2>&1; then
+    DATE_BACKEND="gnu"
+  else
+    log_error "this system date command is not supported."
+    exit 1
+  fi
+}
+
+format_epoch() {
+  local epoch="$1" format="$2"
+  case "$DATE_BACKEND" in
+    bsd) date -r "$epoch" "$format" ;;
+    gnu) date -d "@$epoch" "$format" ;;
+    *) log_error "date backend not initialized."; exit 1 ;;
+  esac
+}
+
+epoch_to_cron_fields() {
+  format_epoch "$1" '+%M %H %d %m %w'
+}
+
+format_human_time() {
+  format_epoch "$1" '+%Y-%m-%d %H:%M:%S %Z'
+}
+
+normalize_cron_expr() {
+  case "$CRON_EXPR" in
+    @yearly|@annually) CRON_EXPR='0 0 1 1 *' ;;
+    @monthly) CRON_EXPR='0 0 1 * *' ;;
+    @weekly) CRON_EXPR='0 0 * * 0' ;;
+    @daily|@midnight) CRON_EXPR='0 0 * * *' ;;
+    @hourly) CRON_EXPR='0 * * * *' ;;
+  esac
+}
+
+normalize_field_names() {
+  local value="$1" kind="$2"
+  value=$(printf '%s' "$value" | tr '[:lower:]' '[:upper:]')
+  case "$kind" in
+    month)
+      value="${value//JAN/1}"
+      value="${value//FEB/2}"
+      value="${value//MAR/3}"
+      value="${value//APR/4}"
+      value="${value//MAY/5}"
+      value="${value//JUN/6}"
+      value="${value//JUL/7}"
+      value="${value//AUG/8}"
+      value="${value//SEP/9}"
+      value="${value//OCT/10}"
+      value="${value//NOV/11}"
+      value="${value//DEC/12}"
+      ;;
+    weekday)
+      value="${value//SUN/0}"
+      value="${value//MON/1}"
+      value="${value//TUE/2}"
+      value="${value//WED/3}"
+      value="${value//THU/4}"
+      value="${value//FRI/5}"
+      value="${value//SAT/6}"
+      ;;
+  esac
+  printf '%s\n' "$value"
+}
+
+parse_cron_number() {
+  local raw="$1" min="$2" max="$3" field_name="$4"
+  [[ "$raw" =~ ^[0-9]+$ ]] || { log_error "invalid $field_name field value: $raw"; exit 1; }
+  local value=$((10#$raw))
+  (( value >= min && value <= max )) || { log_error "$field_name field value out of range: $raw"; exit 1; }
+  printf '%s\n' "$value"
+}
+
+canonicalize_weekday() {
+  local value="$1"
+  if [[ "$value" -eq 7 ]]; then
+    printf '0\n'
+  else
+    printf '%s\n' "$value"
+  fi
+}
+
+build_value_set() {
+  local raw_field="$1" parse_min="$2" parse_max="$3" output_min="$4" output_max="$5"
+  local kind="$6" field_name="$7" output_var="$8"
+  local normalized part base step start end current canonical values=""
+  local -a allowed=()
+
+  normalized=$(normalize_field_names "$raw_field" "$kind")
+  IFS=',' read -r -a parts <<< "$normalized"
+  [[ ${#parts[@]} -gt 0 ]] || { log_error "invalid $field_name field: $raw_field"; exit 1; }
+
+  for part in "${parts[@]}"; do
+    [[ -n "$part" ]] || { log_error "invalid $field_name field: $raw_field"; exit 1; }
+    base="$part"
+    step=1
+    if [[ "$part" == */* ]]; then
+      [[ "$part" != */*/* ]] || { log_error "invalid $field_name field step: $part"; exit 1; }
+      base="${part%/*}"
+      step="${part#*/}"
+      [[ "$step" =~ ^[0-9]+$ ]] || { log_error "invalid $field_name field step: $part"; exit 1; }
+      (( 10#$step > 0 )) || { log_error "$field_name field step must be greater than zero: $part"; exit 1; }
+      step=$((10#$step))
+    fi
+
+    if [[ "$base" == "*" ]]; then
+      start="$parse_min"
+      end="$parse_max"
+    elif [[ "$base" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      start=$(parse_cron_number "${BASH_REMATCH[1]}" "$parse_min" "$parse_max" "$field_name")
+      end=$(parse_cron_number "${BASH_REMATCH[2]}" "$parse_min" "$parse_max" "$field_name")
+      (( start <= end )) || { log_error "$field_name field range start exceeds end: $part"; exit 1; }
+    else
+      start=$(parse_cron_number "$base" "$parse_min" "$parse_max" "$field_name")
+      end="$start"
+    fi
+
+    for ((current = start; current <= end; current += step)); do
+      if [[ "$kind" == "weekday" ]]; then
+        canonical=$(canonicalize_weekday "$current")
+      else
+        canonical="$current"
+      fi
+      allowed[$canonical]=1
+    done
+  done
+
+  for ((current = output_min; current <= output_max; current++)); do
+    [[ "${allowed[$current]:-0}" == "1" ]] || continue
+    [[ -n "$values" ]] && values+=" "
+    values+="$current"
+  done
+
+  [[ -n "$values" ]] || { log_error "invalid $field_name field: $raw_field"; exit 1; }
+  printf -v "$output_var" '%s' "$values"
+}
+
+value_in_set() {
+  local values="$1" needle="$2"
+  [[ " $values " == *" $needle "* ]]
+}
+
+cron_matches_epoch() {
+  local epoch="$1" minute hour day_of_month month day_of_week
+  local dom_match=false dow_match=false
+  read -r minute hour day_of_month month day_of_week <<< "$(epoch_to_cron_fields "$epoch")"
+  minute=$((10#$minute))
+  hour=$((10#$hour))
+  day_of_month=$((10#$day_of_month))
+  month=$((10#$month))
+  day_of_week=$((10#$day_of_week))
+
+  value_in_set "$MINUTE_VALUES" "$minute" || return 1
+  value_in_set "$HOUR_VALUES" "$hour" || return 1
+  value_in_set "$MONTH_VALUES" "$month" || return 1
+  value_in_set "$DAY_OF_MONTH_VALUES" "$day_of_month" && dom_match=true
+  value_in_set "$DAY_OF_WEEK_VALUES" "$day_of_week" && dow_match=true
+
+  if [[ "$DAY_OF_MONTH_FIELD" == "*" && "$DAY_OF_WEEK_FIELD" == "*" ]]; then
+    return 0
+  fi
+  if [[ "$DAY_OF_MONTH_FIELD" == "*" ]]; then
+    [[ "$dow_match" == "true" ]]
+    return
+  fi
+  if [[ "$DAY_OF_WEEK_FIELD" == "*" ]]; then
+    [[ "$dom_match" == "true" ]]
+    return
+  fi
+  [[ "$dom_match" == "true" || "$dow_match" == "true" ]]
+}
+
+validate_config() {
+  [[ -n "$CRON_EXPR" ]] || { log_error "--cron is required."; exit 1; }
+  [[ "$MAX_TRIGGERS" =~ ^[0-9]+$ ]] || { log_error "max-triggers must be a non-negative integer."; exit 1; }
+
+  normalize_cron_expr
+  init_date_backend
+
+  local -a fields=()
+  read -r -a fields <<< "$CRON_EXPR"
+  [[ ${#fields[@]} -eq 5 ]] || { log_error "cron expression must contain exactly 5 fields."; exit 1; }
+
+  MINUTE_FIELD="${fields[0]}"
+  HOUR_FIELD="${fields[1]}"
+  DAY_OF_MONTH_FIELD="${fields[2]}"
+  MONTH_FIELD="${fields[3]}"
+  DAY_OF_WEEK_FIELD="${fields[4]}"
+
+  build_value_set "$MINUTE_FIELD" 0 59 0 59 minute minute MINUTE_VALUES
+  build_value_set "$HOUR_FIELD" 0 23 0 23 hour hour HOUR_VALUES
+  build_value_set "$DAY_OF_MONTH_FIELD" 1 31 1 31 day_of_month day-of-month DAY_OF_MONTH_VALUES
+  build_value_set "$MONTH_FIELD" 1 12 1 12 month month MONTH_VALUES
+  build_value_set "$DAY_OF_WEEK_FIELD" 0 7 0 6 weekday day-of-week DAY_OF_WEEK_VALUES
+}
+
+write_state() {
+  local decision="${1:-null}" hook_called="${2:-false}"
+  mkdir -p "$GEMINI_DIR"
+  cat > "$STATE_FILE" << EOF
+{
+  "active": true,
+  "completion_promise": $(printf '%s' "$COMPLETION_PROMISE" | jq -Rs .),
+  "decision": $(if [ "$decision" = "null" ]; then echo "null"; else echo "\"$decision\""; fi),
+  "hook_called": $hook_called
+}
+EOF
+}
+
+read_decision() {
+  [[ -f "$STATE_FILE" ]] && jq -r '.decision // "null"' "$STATE_FILE" || echo "null"
+}
+
+read_hook_called() {
+  [[ -f "$STATE_FILE" ]] && jq -r '.hook_called // false' "$STATE_FILE" || echo "false"
+}
+
+create_hook_script() {
+  mkdir -p "$HOOKS_DIR"
+  cat > "$HOOK_SCRIPT_PATH" << 'HOOKEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_FILE="${GEMINI_PROJECT_DIR}/.gemini/gemini-timer.state.json"
+DEBUG_FLAG_FILE="${GEMINI_PROJECT_DIR}/.gemini/gemini-timer.debug"
+HOOK_LOG_FILE="${GEMINI_PROJECT_DIR}/.gemini/gemini-timer-hook.log"
+
+debug_log() {
+  [[ -f "$DEBUG_FLAG_FILE" ]] || return 0
+  mkdir -p "$(dirname "$HOOK_LOG_FILE")"
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$HOOK_LOG_FILE"
+}
+
+INPUT=$(cat)
+
+[[ ! -f "$STATE_FILE" ]] && exit 0
+
+STATE=$(cat "$STATE_FILE")
+[[ $(echo "$STATE" | jq -r '.active // false') != "true" ]] && exit 0
+
+COMPLETION_PROMISE=$(echo "$STATE" | jq -r '.completion_promise // ""')
+PROMPT_RESPONSE=$(echo "$INPUT" | jq -r '.prompt_response // empty')
+
+debug_log "AfterAgent hook started: completion_promise=${COMPLETION_PROMISE:-<none>}"
+
+DECISION="done"
+if [[ -n "$COMPLETION_PROMISE" ]] && [[ -n "$PROMPT_RESPONSE" ]] && grep -qF -- "$COMPLETION_PROMISE" <<< "$PROMPT_RESPONSE"; then
+  DECISION="complete"
+  debug_log "decision=complete (completion promise matched)"
+else
+  debug_log "decision=done"
+fi
+
+jq --arg d "$DECISION" '.decision = $d | .hook_called = true' \
+  "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+
+printf '%s\n' '{"continue": false}'
+exit 0
+HOOKEOF
+
+  chmod +x "$HOOK_SCRIPT_PATH"
+  if [[ "$DEBUG" == "true" ]]; then
+    touch "${GEMINI_DIR}/gemini-timer.debug"
+  fi
+}
+
+merge_settings() {
+  mkdir -p "$GEMINI_DIR"
+  TARGET_SETTINGS_BACKUP="${SETTINGS_PROJECT}.gemini-timer-backup"
+
+  local hook_entry='{"matcher":"*","hooks":[{"name":"gemini-timer","type":"command","command":"\"$GEMINI_PROJECT_DIR\"/.gemini/hooks/gemini-timer-hook.sh"}]}'
+
+  if [[ -f "$SETTINGS_PROJECT" ]]; then
+    cp "$SETTINGS_PROJECT" "$TARGET_SETTINGS_BACKUP"
+    jq --argjson hook "$hook_entry" '
+      if .hooks.AfterAgent then
+        .hooks.AfterAgent += [$hook]
+      elif .hooks then
+        .hooks.AfterAgent = [$hook]
+      else
+        . + {"hooks":{"AfterAgent":[$hook]}}
+      end
+    ' "$SETTINGS_PROJECT" > "${SETTINGS_PROJECT}.tmp" && mv "${SETTINGS_PROJECT}.tmp" "$SETTINGS_PROJECT"
+  else
+    cat > "$SETTINGS_PROJECT" << 'EOF'
+{"hooks":{"AfterAgent":[{"matcher":"*","hooks":[{"name":"gemini-timer","type":"command","command":"\"$GEMINI_PROJECT_DIR\"/.gemini/hooks/gemini-timer-hook.sh"}]}]}}
+EOF
+  fi
+
+  SETTINGS_MODIFIED=true
+  log "AfterAgent hook registered in settings.json"
+}
+
+restore_settings() {
+  if [[ "$SETTINGS_MODIFIED" == "true" ]]; then
+    if [[ -f "$TARGET_SETTINGS_BACKUP" ]]; then
+      mv "$TARGET_SETTINGS_BACKUP" "$SETTINGS_PROJECT"
+    else
+      rm -f "$SETTINGS_PROJECT"
+    fi
+    SETTINGS_MODIFIED=false
+  fi
+}
+
+cleanup() {
+  local exit_code=$?
+  rm -f "$HOOK_SCRIPT_PATH"
+  rm -f "${GEMINI_DIR}/gemini-timer.debug"
+  rm -f "$HOOK_LOG_FILE"
+  rmdir "$HOOKS_DIR" 2>/dev/null || true
+  restore_settings
+  rm -f "$STATE_FILE"
+  exit "$exit_code"
+}
+
+run_gemini_once() {
+  local -a args=("$@")
+
+  write_state "null" "false"
+
+  set +e
+  gemini "${args[@]}"
+  local gemini_exit_code=$?
+  set -e
+
+  local decision hook_called
+  decision=$(read_decision)
+  hook_called=$(read_hook_called)
+
+  log "gemini exited (code=$gemini_exit_code, decision=$decision, hook=$hook_called)"
+
+  LAST_EXIT_CODE=$gemini_exit_code
+  LAST_DECISION=$decision
+  LAST_HOOK_CALLED=$hook_called
+}
+
+eval_run_result() {
+  if [[ "$LAST_HOOK_CALLED" != "true" ]]; then
+    log "hook not called; exiting with gemini's status"
+    TIMER_EXIT_CODE=$LAST_EXIT_CODE
+    return 1
+  fi
+
+  case "$LAST_DECISION" in
+    complete)
+      log "completion promise matched after trigger $TRIGGER_COUNT"
+      TIMER_EXIT_CODE=0
+      return 1
+      ;;
+    done)
+      return 0
+      ;;
+    *)
+      log_error "unexpected decision: $LAST_DECISION"
+      TIMER_EXIT_CODE=1
+      return 1
+      ;;
+  esac
+}
+
+next_minute_boundary_epoch() {
+  local now
+  now=$(date +%s)
+  printf '%s\n' $(( ((now / 60) + 1) * 60 ))
+}
+
+current_minute_epoch() {
+  local now
+  now=$(date +%s)
+  printf '%s\n' $(( (now / 60) * 60 ))
+}
+
+sleep_until_epoch() {
+  local target="$1"
+  while true; do
+    local now remaining
+    now=$(date +%s)
+    remaining=$((target - now))
+    (( remaining <= 0 )) && return 0
+    sleep "$remaining"
+  done
+}
+
+main() {
+  parse_args "$@"
+  validate_config
+  check_dependencies
+  trap cleanup EXIT INT TERM
+
+  log "cron=$CRON_EXPR max_triggers=$MAX_TRIGGERS completion_promise=${COMPLETION_PROMISE:-<none>}"
+
+  create_hook_script
+  merge_settings
+
+  TIMER_EXIT_CODE=0
+
+  while true; do
+    local target_epoch check_epoch
+    target_epoch=$(next_minute_boundary_epoch)
+    log "next schedule check at $(format_human_time "$target_epoch")"
+    sleep_until_epoch "$target_epoch"
+
+    check_epoch=$(current_minute_epoch)
+    if ! cron_matches_epoch "$check_epoch"; then
+      log "schedule did not match at $(format_human_time "$check_epoch")"
+      continue
+    fi
+
+    TRIGGER_COUNT=$((TRIGGER_COUNT + 1))
+    log "schedule matched at $(format_human_time "$check_epoch"), running gemini (trigger $TRIGGER_COUNT)"
+
+    run_gemini_once "${GEMINI_ARGS[@]}"
+    if ! eval_run_result; then
+      return "$TIMER_EXIT_CODE"
+    fi
+
+    if [[ "$MAX_TRIGGERS" -gt 0 ]] && [[ "$TRIGGER_COUNT" -ge "$MAX_TRIGGERS" ]]; then
+      log "maximum triggers reached: $TRIGGER_COUNT"
+      return 0
+    fi
+
+    log "trigger $TRIGGER_COUNT complete, waiting for next schedule"
+  done
+}
+
+main "$@"

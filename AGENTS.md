@@ -1,6 +1,6 @@
 # agent-loop
 
-Bash scripts to run CLI-based AI agents (Claude Code, Codex CLI, Gemini CLI, Copilot CLI, OpenCode, etc.) in automated loops, watches, and file-list batches.
+Bash scripts to run CLI-based AI agents (Claude Code, Codex CLI, Gemini CLI, Copilot CLI, OpenCode, etc.) in automated loops, timers, watches, and file-list batches.
 
 ## Design philosophy
 
@@ -19,12 +19,19 @@ Each iteration starts as a brand-new session. The agent picks up previous work t
 ## Structure
 
 - `claude-loop` — Loop wrapper for Claude Code using Stop hooks
+- `claude-timer` — Scheduled trigger wrapper for Claude Code using Stop hooks
 - `codex-loop` — Standalone loop wrapper for Codex CLI using Stop hooks
+- `codex-timer` — Standalone scheduled trigger wrapper for Codex CLI using Stop hooks
 - `gemini-loop` — Loop wrapper for Gemini CLI using AfterAgent hooks
+- `gemini-timer` — Scheduled trigger wrapper for Gemini CLI using AfterAgent hooks
 - `copilot-loop` — Loop wrapper for GitHub Copilot CLI using agentStop hooks
+- `copilot-timer` — Scheduled trigger wrapper for GitHub Copilot CLI using agentStop hooks
 - `cursor-loop` — Standalone loop wrapper for Cursor Agent CLI using plain process restarts
+- `cursor-timer` — Standalone scheduled trigger wrapper for Cursor Agent CLI using plain process restarts
 - `opencode-loop` — Standalone loop wrapper for OpenCode CLI using plain process restarts
+- `opencode-timer` — Standalone scheduled trigger wrapper for OpenCode CLI using plain process restarts
 - `cline-loop` — Standalone loop wrapper for Cline CLI using plain process restarts
+- `cline-timer` — Standalone scheduled trigger wrapper for Cline CLI using plain process restarts
 - `claude-files` — File-list wrapper for Claude Code using Stop hooks
 - `codex-files` — Standalone file-list wrapper for Codex CLI using Stop hooks
 - `gemini-files` — File-list wrapper for Gemini CLI using AfterAgent hooks

@@ -1,7 +1,7 @@
 # agent-loop
 
 Single-file Bash wrappers for running CLI-based AI agents in restart loops,
-file watches, and file-list batches.
+scheduled timers, file watches, and file-list batches.
 
 The core idea is to terminate the agent process after each iteration and start
 it again as a brand-new process. This keeps every iteration on a fresh session
@@ -16,12 +16,19 @@ wrapper, not the agent, responsible for loop control.
 ## Included tools
 
 - `claude-loop`: Claude Code wrapper using Claude Stop hooks
+- `claude-timer`: Claude Code wrapper triggered by cron expressions
 - `codex-loop`: Codex CLI wrapper using project-local Codex Stop hooks
+- `codex-timer`: Codex CLI wrapper triggered by cron expressions
 - `gemini-loop`: Gemini CLI wrapper for iterative process restarts
+- `gemini-timer`: Gemini CLI wrapper triggered by cron expressions
 - `copilot-loop`: GitHub Copilot CLI wrapper for iterative process restarts
+- `copilot-timer`: GitHub Copilot CLI wrapper triggered by cron expressions
 - `cursor-loop`: Cursor Agent CLI wrapper for iterative process restarts
+- `cursor-timer`: Cursor Agent CLI wrapper triggered by cron expressions
 - `opencode-loop`: OpenCode CLI wrapper for iterative process restarts
+- `opencode-timer`: OpenCode CLI wrapper triggered by cron expressions
 - `cline-loop`: Cline CLI wrapper for iterative process restarts
+- `cline-timer`: Cline CLI wrapper triggered by cron expressions
 - `claude-files`: Claude Code wrapper for newline-delimited file lists
 - `codex-files`: Codex CLI wrapper for newline-delimited file lists
 - `gemini-files`: Gemini CLI wrapper for newline-delimited file lists
@@ -52,7 +59,7 @@ You can also clone the repository and install whichever scripts you need.
 ```bash
 git clone <repo-url>
 cd agent-loop
-chmod +x claude-loop claude-watch codex-loop codex-watch gemini-loop gemini-watch copilot-loop copilot-watch cursor-loop cursor-watch opencode-loop opencode-watch cline-loop cline-watch
+chmod +x claude-loop claude-timer claude-watch codex-loop codex-timer codex-watch gemini-loop gemini-timer gemini-watch copilot-loop copilot-timer copilot-watch cursor-loop cursor-timer cursor-watch opencode-loop opencode-timer opencode-watch cline-loop cline-timer cline-watch
 ```
 
 You can also install the file-list wrappers:
@@ -73,6 +80,26 @@ All wrappers follow the same high-level model:
 Wrappers that use agent-specific stop hooks can actively end a turn and return
 control to the wrapper. Plain restart wrappers still depend on the upstream CLI
 exiting on its own before the next iteration can begin.
+
+## Timer behavior
+
+All `*-timer` wrappers follow this model:
+
+1. Wait until the next minute that matches the configured cron expression.
+2. Launch the target CLI as a new process.
+3. Wait for the CLI to exit or for a timer-specific hook to end the run.
+4. Stop if the maximum trigger count or completion promise was reached.
+5. Otherwise wait for the next matching minute.
+
+Timer wrappers use one-minute cron resolution and do not backfill triggers that
+were missed while the agent was still running.
+
+All `*-timer` wrappers support:
+
+- `--cron EXPR`
+- `--max-triggers N`
+- `--completion-promise TEXT`
+- `--debug`
 
 ## Wrapper options
 
@@ -114,6 +141,18 @@ All `*-files` wrappers support:
 - Uses Claude's Stop hook mechanism, so it can keep Claude working without
   relying on process exit alone
 
+### `claude-timer`
+
+- Depends on `claude` and `jq`
+- Waits for the next minute matching a 5-field cron expression, then runs
+  Claude Code
+- Supports ranges, lists, steps, month names, weekday names, and aliases such
+  as `@hourly`, `@daily`, `@weekly`, `@monthly`, and `@yearly`
+- Uses Claude's Stop hook mechanism so both print and interactive modes can
+  return control after each scheduled run
+- Uses one-minute schedule resolution and does not backfill triggers missed
+  while Claude was still running
+
 ### `claude-files`
 
 - Depends on `claude` and `jq`
@@ -145,6 +184,17 @@ All `*-files` wrappers support:
 - Enables the experimental `codex_hooks` feature for the wrapped Codex run and
   restores any prior project-local hooks file on exit
 
+### `codex-timer`
+
+- Depends on `codex` and `jq`
+- Waits for the next minute matching a 5-field cron expression, then runs
+  Codex CLI
+- Uses a project-local Codex `Stop` hook under `.codex/hooks.json`
+- Terminates Codex after each scheduled trigger so both interactive and `exec`
+  sessions can return control to the timer
+- Enables the experimental `codex_hooks` feature for the wrapped Codex run and
+  restores any prior project-local hooks file on exit
+
 ### `codex-files`
 
 - Depends on `codex` and `jq`
@@ -171,6 +221,14 @@ All `*-files` wrappers support:
 - Gemini positional prompts are one-shot by default, and interactive
   `-i/--prompt-interactive` sessions are also loopable via the hook
 
+### `gemini-timer`
+
+- Depends on `gemini` and `jq`
+- Waits for the next minute matching a 5-field cron expression, then runs
+  Gemini CLI
+- Uses a temporary Gemini `AfterAgent` hook to end each scheduled run
+- Supports both positional prompts and interactive `-i` sessions
+
 ### `gemini-files`
 
 - Depends on `gemini` and `jq`
@@ -189,6 +247,18 @@ All `*-files` wrappers support:
 - Works for prompt mode and interactive sessions by terminating Copilot after
   each completed agent turn
 
+### `copilot-timer`
+
+- Depends on `copilot` and `jq`
+- Waits for the next minute matching a 5-field cron expression, then runs
+  GitHub Copilot CLI
+- Uses project-local Copilot `agentStop` and `errorOccurred` hooks under
+  `.github/hooks/`
+- Accepts a single positional prompt and runs it as `copilot -i` when no
+  explicit Copilot mode or subcommand is provided
+- Terminates Copilot after each scheduled run and keeps waiting after
+  hook-observable execution errors
+
 ### `copilot-files`
 
 - Depends on `copilot` and `jq`
@@ -206,6 +276,16 @@ All `*-files` wrappers support:
 - Interactive Cursor Agent sessions still launch, but the wrapper cannot start
   the next iteration until the session exits
 
+### `cursor-timer`
+
+- Depends on `cursor-agent`
+- Uses plain process restarts rather than Cursor-specific hooks
+- Waits for the next minute matching a 5-field cron expression, then runs
+  Cursor Agent CLI
+- Reliable autonomous scheduled runs are best with `cursor-agent --print ...`
+- Interactive Cursor Agent sessions still launch, but the timer cannot wait
+  for the next schedule until the session exits
+
 ### `opencode-loop`
 
 - Depends on `opencode`
@@ -213,6 +293,16 @@ All `*-files` wrappers support:
 - Reliable autonomous looping is best with `opencode run ...`
 - The default OpenCode TUI still launches, but the wrapper cannot start the
   next iteration until that session exits
+
+### `opencode-timer`
+
+- Depends on `opencode`
+- Uses plain process restarts rather than OpenCode-specific hooks
+- Waits for the next minute matching a 5-field cron expression, then runs
+  OpenCode CLI
+- Reliable autonomous scheduled runs are best with `opencode run ...`
+- The default OpenCode TUI still launches, but the timer cannot wait for the
+  next schedule until that session exits
 
 ### `cline-loop`
 
@@ -222,6 +312,17 @@ All `*-files` wrappers support:
   headless flags such as `--yolo` or `--no-interactive`
 - Interactive Cline still launches, but the wrapper cannot start the next
   iteration until that session exits
+
+### `cline-timer`
+
+- Depends on `cline`
+- Uses plain process restarts rather than Cline-specific hooks
+- Waits for the next minute matching a 5-field cron expression, then runs
+  Cline CLI
+- Reliable autonomous scheduled runs are best with `cline --oneshot ...` or
+  other headless flags such as `--yolo` or `--no-interactive`
+- Interactive Cline still launches, but the timer cannot wait for the next
+  schedule until the session exits
 
 ### `codex-watch`
 
